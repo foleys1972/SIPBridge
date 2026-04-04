@@ -1,0 +1,228 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sipbridge.io/schemas/v1alpha1/SIPBridgeConfig.json",
+  "title": "SIPBridgeConfig",
+  "type": "object",
+  "required": ["apiVersion", "kind", "spec"],
+  "properties": {
+    "apiVersion": {"type": "string", "const": "sipbridge.io/v1alpha1"},
+    "kind": {"type": "string", "const": "SIPBridgeConfig"},
+    "metadata": {
+      "type": "object",
+      "properties": {
+        "name": {"type": "string"}
+      },
+      "additionalProperties": true
+    },
+    "spec": {
+      "type": "object",
+      "properties": {
+        "routes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["match_user", "target_kind", "target_id"],
+            "properties": {
+              "match_user": {"type": "string"},
+              "target_kind": {"type": "string", "enum": ["bridge", "conferenceGroup", "hootGroup", "ivr"]},
+              "target_id": {"type": "string"}
+            },
+            "additionalProperties": false
+          }
+        },
+        "conferenceGroups": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "name"],
+            "properties": {
+              "id": {"type": "string"},
+              "name": {"type": "string"},
+              "type": {"type": "string", "enum": ["mrd", "ard", "hoot"]},
+              "ring_timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 120},
+              "winner_keep_ringing_seconds": {"type": "integer", "minimum": 0, "maximum": 120},
+              "ddi_access_enabled": {"type": "boolean"},
+              "ddi_access_number": {"type": "string"},
+              "recording_enabled": {"type": "boolean"},
+              "sideA": {"$ref": "#/$defs/endpoints"},
+              "sideB": {"$ref": "#/$defs/endpoints"}
+            },
+            "additionalProperties": false
+          }
+        },
+        "hootGroups": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "name"],
+            "properties": {
+              "id": {"type": "string"},
+              "name": {"type": "string"},
+              "talkers": {"$ref": "#/$defs/endpoints"},
+              "listeners": {"$ref": "#/$defs/endpoints"}
+            },
+            "additionalProperties": false
+          }
+        },
+        "bridges": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "name"],
+            "properties": {
+              "id": {"type": "string"},
+              "name": {"type": "string"},
+              "type": {"type": "string"},
+              "ring_timeout_seconds": {"type": "integer"},
+              "ddi_access_enabled": {"type": "boolean"},
+              "ddi_access_number": {"type": "string"},
+              "participants": {"type": "array"}
+            },
+            "additionalProperties": true
+          }
+        },
+        "users": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "participant_id"],
+            "properties": {
+              "id": {"type": "string"},
+              "display_name": {"type": "string"},
+              "participant_id": {"type": "string"},
+              "region": {"type": "string"},
+              "allowed_bridge_ids": {"type": "array", "items": {"type": "string"}},
+              "allowed_conference_group_ids": {"type": "array", "items": {"type": "string"}},
+              "recording_opt_in": {"type": "boolean"},
+              "devices": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": ["id", "kind"],
+                  "properties": {
+                    "id": {"type": "string"},
+                    "kind": {"type": "string", "enum": ["ddi", "mobile", "private_wire"]},
+                    "address": {"type": "string"},
+                    "cti": {"type": "object", "additionalProperties": {"type": "string"}}
+                  },
+                  "additionalProperties": false
+                }
+              }
+            },
+            "additionalProperties": true
+          }
+        },
+        "ivr": {
+          "type": "object",
+          "properties": {
+            "entry_user": {"type": "string"}
+          },
+          "additionalProperties": true
+        },
+        "servers": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "name", "api_base_url"],
+            "properties": {
+              "id": {"type": "string"},
+              "name": {"type": "string"},
+              "api_base_url": {"type": "string"},
+              "region": {"type": "string"},
+              "tls_skip_verify": {"type": "boolean"},
+              "sip_ingress_uri": {"type": "string"},
+              "interconnect_sip_uri": {"type": "string"},
+              "capacity_weight": {"type": "integer", "minimum": 0, "maximum": 100}
+            },
+            "additionalProperties": false
+          }
+        },
+        "cluster": {
+          "type": "object",
+          "properties": {
+            "max_concurrent_calls": {"type": "integer", "minimum": 0},
+            "soft_max_concurrent_calls": {"type": "integer", "minimum": 0},
+            "overflow_redirect_enabled": {"type": "boolean"},
+            "overflow_redirect_sip_uri": {"type": "string"}
+          },
+          "additionalProperties": false
+        },
+        "database": {
+          "type": "object",
+          "properties": {
+            "config_storage": {"type": "string", "enum": ["yaml", "http", "postgres"]},
+            "postgres": {
+              "type": "object",
+              "properties": {
+                "host": {"type": "string"},
+                "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+                "user": {"type": "string"},
+                "database": {"type": "string"},
+                "ssl_mode": {"type": "string"},
+                "password_env_var": {"type": "string"},
+                "schema": {"type": "string"}
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        },
+        "recording": {
+          "type": "object",
+          "properties": {
+            "global_enabled": {"type": "boolean"},
+            "siprec": {
+              "type": "object",
+              "properties": {
+                "enabled": {"type": "boolean"},
+                "recorder_sip_uri": {"type": "string"},
+                "recording_trunk_sip_uri": {"type": "string"},
+                "metadata_namespace": {"type": "string"},
+                "trunks": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "required": ["id", "recorder_sip_uri"],
+                    "properties": {
+                      "id": {"type": "string"},
+                      "label": {"type": "string"},
+                      "recorder_sip_uri": {"type": "string"},
+                      "recording_trunk_sip_uri": {"type": "string"}
+                    },
+                    "additionalProperties": false
+                  }
+                },
+                "default_trunk_id": {"type": "string"},
+                "region_to_trunk": {
+                  "type": "object",
+                  "additionalProperties": {"type": "string"}
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "$defs": {
+    "endpoints": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "sip_uri"],
+        "properties": {
+          "id": {"type": "string"},
+          "display_name": {"type": "string"},
+          "sip_uri": {"type": "string"},
+          "location": {"type": "string"},
+          "linked_user_id": {"type": "string"},
+          "linked_device_id": {"type": "string"}
+        },
+        "additionalProperties": false
+      }
+    }
+  }
+}

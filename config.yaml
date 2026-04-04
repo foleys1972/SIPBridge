@@ -1,0 +1,83 @@
+apiVersion: sipbridge.io/v1alpha1
+kind: SIPBridgeConfig
+metadata:
+    name: default
+spec:
+    routes:
+        - match_user: "1000"
+          target_kind: bridge
+          target_id: room-1000
+    bridges:
+        - id: room-1000
+          name: Room 1000
+          type: ""
+          ring_timeout_seconds: 0
+          ddi_access_enabled: true
+          ddi_access_number: "1000"
+          participants: []
+    conferenceGroups:
+        - id: conf-001
+          name: Conference Lines Example
+          type: mrd
+          ring_timeout_seconds: 30
+          winner_keep_ringing_seconds: 0
+          ddi_access_enabled: true
+          ddi_access_number: "1111"
+          sideA:
+            - id: a-1
+              display_name: A-1
+              sip_uri: sip:desk-a1@example.invalid
+              location: LDN
+            - id: a-2
+              display_name: A-2
+              sip_uri: sip:desk-a2@example.invalid
+              location: LDN
+            - id: a-3
+              display_name: A-3
+              sip_uri: sip:2000@192.168.1.41
+              location: ""
+            - id: a-4
+              display_name: A-4
+              sip_uri: sip:2000@127.0.0.1:5062
+              location: ""
+          sideB:
+            - id: b-1
+              display_name: B-1
+              sip_uri: sip:desk-b1@example.invalid
+              location: NYC
+            - id: b-2
+              display_name: B-2
+              sip_uri: sip:desk-b2@example.invalid
+              location: NYC
+            - id: b-3
+              display_name: B-3
+              sip_uri: sip:2001@192.168.1.94
+              location: ""
+    hootGroups: []
+    users:
+        - id: u-1
+          display_name: Demo User
+          participant_id: "1234"
+          allowed_bridge_ids:
+            - room-1000
+          allowed_conference_group_ids:
+            - conf-001
+        - id: u-2
+          display_name: Demo2
+          participant_id: "5678"
+          allowed_bridge_ids:
+            - room-1000
+          allowed_conference_group_ids:
+            - conf-001
+    ivr:
+        entry_user: "9000"
+    servers:
+        - id: EMEA-1
+          name: EMEA-1
+          api_base_url: http://localhost:5173
+          region: EMEA
+    # cluster:
+    #   max_concurrent_calls: 2000
+    #   soft_max_concurrent_calls: 1600
+    #   overflow_redirect_enabled: false
+    #   overflow_redirect_sip_uri: sip:pool@backup.example.invalid

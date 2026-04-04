@@ -1,0 +1,18 @@
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+node_modules/
+ui/node_modules/
+.env
+.env.*
+.DS_Store
+
+# Vite / TS build artifacts
+ui/tsconfig.tsbuildinfo
+ui/vite.config.ts.timestamp-*.mjs
