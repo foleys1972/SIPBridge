@@ -231,14 +231,19 @@ export default function UserDetailPage() {
           )}
         </div>
 
-        <label className="flex items-center gap-2 text-sm text-slate-300">
-          <input
-            type="checkbox"
-            checked={recordingOptIn}
-            onChange={(e) => setRecordingOptIn(e.target.checked)}
-            disabled={Boolean(cfgStatus?.config_read_only)}
-          />
-          Eligible for recording (PIN dial-in): include employee id and metadata when global recording is on
+        <label className="flex flex-col gap-1 text-sm text-slate-300">
+          <span className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={recordingOptIn}
+              onChange={(e) => setRecordingOptIn(e.target.checked)}
+              disabled={Boolean(cfgStatus?.config_read_only)}
+            />
+            Record this participant when group/bridge-wide recording is off
+          </span>
+          <span className="text-xs text-slate-500">
+            Requires IVR PIN identification, or a conference leg linked to this user with a matching SIP From URI. When the conference group has Record conference on, everyone on that group is recorded regardless of this box.
+          </span>
         </label>
 
         <div>

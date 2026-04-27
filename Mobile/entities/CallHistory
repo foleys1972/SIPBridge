@@ -1,0 +1,67 @@
+{
+  "name": "CallHistory",
+  "type": "object",
+  "properties": {
+    "line_id": {
+      "type": "string",
+      "description": "ID of the line"
+    },
+    "line_name": {
+      "type": "string",
+      "description": "Name of the line at time of call"
+    },
+    "counterparty": {
+      "type": "string",
+      "description": "Counterparty name"
+    },
+    "line_type": {
+      "type": "string",
+      "enum": [
+        "ARD",
+        "MRD",
+        "HOOT"
+      ],
+      "description": "Line type"
+    },
+    "trader_id": {
+      "type": "string",
+      "description": "Trader ID who handled the call"
+    },
+    "trader_name": {
+      "type": "string",
+      "description": "Trader display name"
+    },
+    "desk": {
+      "type": "string",
+      "description": "Trader desk"
+    },
+    "started_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Call start time"
+    },
+    "ended_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Call end time"
+    },
+    "duration_seconds": {
+      "type": "number",
+      "description": "Duration in seconds"
+    },
+    "outcome": {
+      "type": "string",
+      "enum": [
+        "connected",
+        "missed",
+        "declined"
+      ],
+      "default": "connected",
+      "description": "Call outcome"
+    }
+  },
+  "required": [
+    "line_id",
+    "line_name"
+  ]
+}

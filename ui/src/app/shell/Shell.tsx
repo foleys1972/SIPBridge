@@ -1,29 +1,30 @@
 import React from 'react'
 import { NavLink, useLocation } from 'react-router-dom'
 import { Activity, Cable, LayoutDashboard, LineChart, Network, Server, Settings, Share2 } from 'lucide-react'
-import { useAuth, type Role } from '../auth/AuthContext'
+import { useAuth } from '../auth/AuthContext'
 
 function navLinkClass({ isActive }: { isActive: boolean }) {
   return [
-    'flex items-center gap-2 rounded-md px-3 py-2 text-sm transition',
-    isActive ? 'bg-slate-800 text-slate-50' : 'text-slate-300 hover:bg-slate-900',
+    'flex items-center gap-3 rounded-2xl px-4 py-3 text-sm font-medium transition duration-150',
+    isActive ? 'bg-slate-800 text-slate-50 shadow-sm' : 'text-slate-300 hover:bg-slate-900 hover:text-slate-50',
   ].join(' ')
 }
 
-function RoleSelect() {
-  const { role, setRole } = useAuth()
+function UserBadge() {
+  const { role, user, logout, authEnabled } = useAuth()
+  if (!authEnabled) {
+    return (
+      <div className="flex flex-wrap items-center gap-2 rounded-full border border-slate-800 bg-slate-900 px-3 py-2 text-xs text-slate-300">
+        <span className="font-semibold text-slate-200">RBAC</span>
+        <span className="font-mono">disabled</span>
+      </div>
+    )
+  }
   return (
-    <div className="flex items-center gap-2">
-      <div className="text-xs text-slate-400">Role</div>
-      <select
-        className="rounded-md border border-slate-800 bg-slate-950 px-2 py-1 text-sm text-slate-100"
-        value={role}
-        onChange={(e) => setRole(e.target.value as Role)}
-      >
-        <option value="readonly">readonly</option>
-        <option value="operator">operator</option>
-        <option value="admin">admin</option>
-      </select>
+    <div className="flex flex-wrap items-center gap-2 rounded-xl border border-slate-800 bg-slate-900 px-3 py-2 text-xs text-slate-300">
+      <span className="font-semibold text-slate-200">{user?.username ?? '—'}</span>
+      <span className="rounded bg-slate-800 px-2 py-0.5 font-mono">{role}</span>
+      <button className="rounded border border-slate-700 px-2 py-0.5 hover:bg-slate-800" onClick={() => logout()}>Sign out</button>
     </div>
   )
 }
@@ -33,15 +34,17 @@ export default function Shell({ children }: { children: React.ReactNode }) {
   const settingsArea = location.pathname.startsWith('/settings')
 
   return (
-    <div className="min-h-screen">
+    <div className="min-h-screen bg-slate-950 text-slate-100">
       <div className="mx-auto grid max-w-7xl grid-cols-12 gap-6 px-6 py-6">
-        <aside className="col-span-12 rounded-xl border border-slate-800 bg-slate-950 p-4 lg:col-span-3">
-          <div className="flex items-center justify-between">
-            <div>
-              <div className="text-sm font-semibold tracking-wide text-slate-100">SIPBridge</div>
-              <div className="text-xs text-slate-400">Operations Console</div>
+        <aside className="col-span-12 rounded-[28px] border border-slate-800 bg-slate-900/95 p-5 shadow-xl shadow-slate-950/40 lg:col-span-3">
+          <div className="flex flex-col gap-4">
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <div className="text-sm font-semibold uppercase tracking-[0.18em] text-slate-300">SIPBridge</div>
+                <div className="mt-1 text-sm font-semibold text-slate-100">Operations Console</div>
+              </div>
+              <UserBadge />
             </div>
-            <RoleSelect />
           </div>
 
           <nav className="mt-4 flex flex-col gap-1">
@@ -80,7 +83,9 @@ export default function Shell({ children }: { children: React.ReactNode }) {
         </aside>
 
         <main className="col-span-12 lg:col-span-9">
-          <div className="rounded-xl border border-slate-800 bg-slate-950 p-6">{children}</div>
+          <div className="rounded-[28px] border border-slate-800 bg-slate-950/95 p-6 shadow-xl shadow-slate-950/20">
+            {children}
+          </div>
         </main>
       </div>
     </div>

@@ -6,7 +6,10 @@ import (
 	"math"
 	"math/rand"
 	"net"
+	"os"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -27,11 +30,21 @@ type rtpSession struct {
 	lastEvent        uint8
 	lastEventAt      time.Time
 
+	// rxAudioCount / txPacketCount: audio RTP only (not telephone-event); for SIPBRIDGE_RTP_DEBUG sampling logs.
+	rxAudioCount atomic.Uint64
+	txPacketCount atomic.Uint64
+
 	loggedFirstRx bool
 
 	silenceStarted bool
 
 	closed bool
+}
+
+// rtpDebug enables sampled RTP rx/tx logs (set SIPBRIDGE_RTP_DEBUG=1).
+func rtpDebug() bool {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv("SIPBRIDGE_RTP_DEBUG")))
+	return v == "1" || v == "true" || v == "yes"
 }
 
 func newRTPSession(conn *net.UDPConn, remote *net.UDPAddr, payloadType uint8, telephoneEventPT uint8, onDTMFDigit func(d string)) *rtpSession {
@@ -54,6 +67,26 @@ func (s *rtpSession) SetOnRTPPacket(cb func(pkt []byte)) {
 	}
 	s.mu.Lock()
 	s.onRTPPacket = cb
+	s.mu.Unlock()
+}
+
+// AddOnRTPPacket chains cb after any existing onRTPPacket callback so that
+// both the existing handler (e.g. SIPREC forwarding) and the new one (e.g.
+// local audio capture) receive every packet.
+func (s *rtpSession) AddOnRTPPacket(cb func(pkt []byte)) {
+	if s == nil || cb == nil {
+		return
+	}
+	s.mu.Lock()
+	prev := s.onRTPPacket
+	if prev == nil {
+		s.onRTPPacket = cb
+	} else {
+		s.onRTPPacket = func(pkt []byte) {
+			prev(pkt)
+			cb(pkt)
+		}
+	}
 	s.mu.Unlock()
 }
 
@@ -181,6 +214,11 @@ func (s *rtpSession) StartReceiver() {
 			}
 
 			// Forward non-DTMF RTP (audio) if configured.
+			cnt := s.rxAudioCount.Add(1)
+			if rtpDebug() && (cnt == 1 || cnt%200 == 0) {
+				log.Printf("RTP rx audio pkt=%d pt=%d bytes=%d remote=%s", cnt, pt, n, s.remote.String())
+			}
+
 			s.mu.Lock()
 			cb := s.onRTPPacket
 			s.mu.Unlock()
@@ -265,6 +303,11 @@ func (s *rtpSession) send(payload []byte, marker bool) {
 
 	pkt := append(hdr, payload...)
 	_, _ = s.conn.WriteToUDP(pkt, s.remote)
+
+	tx := s.txPacketCount.Add(1)
+	if rtpDebug() && (tx == 1 || tx%200 == 0) {
+		log.Printf("RTP tx pkt=%d bytes=%d to=%s", tx, len(pkt), s.remote.String())
+	}
 
 	s.seq++
 }

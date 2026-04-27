@@ -23,12 +23,44 @@ export type ConferenceGroup = {
   name: string
   type?: 'mrd' | 'ard' | 'hoot'
   ring_timeout_seconds: number
+  winner_keep_ringing_seconds?: number
   ddi_access_enabled?: boolean
   ddi_access_number?: string
   /** When true and global recording is on, eligible calls may fork to SIPREC. */
   recording_enabled?: boolean
+  iptv_source_ids?: string[]
   sideA?: Endpoint[]
   sideB?: Endpoint[]
+}
+
+export type IPTVSource = {
+  id: string
+  name?: string
+  multicast_ip: string
+  port: number
+  payload_type?: number
+  extract_audio_from_video?: boolean
+  jitter_buffer_ms?: number
+  enabled?: boolean
+}
+
+export type IPTVSubscriptionStatus = {
+  source_id: string
+  running: boolean
+  audio_packets?: number
+  dropped_packets?: number
+  last_audio_at?: string
+  started_at?: string
+  ffmpeg_path?: string
+  ffmpeg_error?: string
+  ffmpeg_found?: boolean
+}
+
+export type HootGroup = {
+  id: string
+  name: string
+  talkers?: Endpoint[]
+  listeners?: Endpoint[]
 }
 
 export type BridgeParticipant = {
@@ -46,6 +78,8 @@ export type Bridge = {
   type?: string
   ddi_access_enabled?: boolean
   ddi_access_number?: string
+  /** When false, SIPREC is not forked for this bridge. Omitted/true = record (when global SIPREC is on). */
+  recording_enabled?: boolean
   participants: BridgeParticipant[]
 }
 
@@ -328,6 +362,115 @@ export type RecordingSettingsResponse = {
   note: string
 }
 
+export type CaptureSpec = {
+  enabled: boolean
+  directory?: string
+  capture_bridges?: boolean
+  capture_conferences?: boolean
+}
+
+export type SIPTrunkSpec = {
+  id: string
+  name?: string
+  proxy_addr: string
+  proxy_port: number
+  transport?: 'udp' | 'tls' | string
+  tls_root_ca_file?: string
+  tls_client_cert_file?: string
+  tls_client_key_file?: string
+  tls_insecure_skip_verify?: boolean
+  tls_server_name?: string
+}
+
+export type DialPlanRule = {
+  id: string
+  enabled?: boolean
+  user_prefix?: string
+  domain?: string
+  uri_regex?: string
+  target_trunk_id: string
+}
+
+export type AuthRole = 'admin' | 'operator' | 'readonly'
+
+export type LocalAuthUser = {
+  username: string
+  password: string
+  role: AuthRole
+}
+
+export type LocalAuthSpec = {
+  enabled: boolean
+  users?: LocalAuthUser[]
+}
+
+export type ADLDSSpec = {
+  enabled: boolean
+  url?: string
+  bind_dn?: string
+  bind_password_env_var?: string
+  base_dn?: string
+  user_filter?: string
+  group_role_map?: Record<string, AuthRole>
+}
+
+export type AuthSpec = {
+  enabled: boolean
+  session_ttl_minutes?: number
+  local?: LocalAuthSpec
+  adlds?: ADLDSSpec
+}
+
+/** Result of POST /v1/settings/recording/test (SIP OPTIONS toward recorder). */
+export type SIPRECProbeResult = {
+  ok: boolean
+  reachable?: boolean
+  target_uri?: string
+  destination?: string
+  error?: string
+  sip_status?: number
+  reason?: string
+  response_preview?: string
+  roundtrip_ms?: number
+  step?: string
+  /** Explains common SIP codes (e.g. 503 + drachtio without Node on 9022). */
+  hint?: string
+}
+
+export type ServiceDashboardRow = {
+  id: string
+  label: string
+  status: string
+  detail?: string
+  latency_ms?: number
+}
+
+export type ServiceDashboardLogEntry = {
+  ts: string
+  level: string
+  message: string
+}
+
+/** SIP Bridge fetches SIPREC GET /api/health/dashboard when SIPREC_RECORDER_BASE_URL is set (default localhost:3030). */
+export type RecorderDashboardSnapshot = {
+  ok: boolean
+  url?: string
+  error?: string
+  latency_ms?: number
+  /** Full JSON from SIPREC (services, bridge, log, …). */
+  payload?: Record<string, unknown>
+}
+
+export type ServiceDashboardResponse = {
+  checked_at: string
+  summary_up: number
+  summary_total: number
+  services: ServiceDashboardRow[]
+  log: ServiceDashboardLogEntry[]
+  note: string
+  recorder?: RecorderDashboardSnapshot | null
+}
+
 /** Saved spec.cluster (partial); merged with env at startup. */
 export type ClusterSpec = {
   max_concurrent_calls?: number | null
@@ -357,7 +500,7 @@ export type RootConfig = {
     routes: Route[]
     bridges: Bridge[]
     conferenceGroups: ConferenceGroup[]
-    hootGroups: unknown[]
+    hootGroups: HootGroup[]
     users?: User[]
     ivr?: IVRConfig
     sipStack?: SIPStackSpec
@@ -365,5 +508,10 @@ export type RootConfig = {
     cluster?: unknown
     database?: DatabaseSpec
     recording?: RecordingSpec
+    iptvSources?: IPTVSource[]
+    capture?: CaptureSpec
+    sipTrunks?: SIPTrunkSpec[]
+    dialPlan?: DialPlanRule[]
+    auth?: AuthSpec
   }
 }

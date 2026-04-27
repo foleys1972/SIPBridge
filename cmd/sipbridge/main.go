@@ -11,6 +11,7 @@ import (
 
 	"sipbridge/internal/api"
 	"sipbridge/internal/config"
+	"sipbridge/internal/logger"
 	"sipbridge/internal/sip"
 )
 
@@ -19,6 +20,13 @@ func main() {
 	if err != nil {
 		log.Fatalf("config: %v", err)
 	}
+
+	// File logging — redirect stdlib log to stdout + rotating daily file.
+	logCloser, err := logger.Init(cfg.LogDir)
+	if err != nil {
+		log.Fatalf("logger: %v", err)
+	}
+	defer logCloser.Close()
 
 	cm, err := config.NewManager(cfg)
 	if err != nil {
@@ -39,6 +47,22 @@ func main() {
 		log.Fatalf("cluster: %v", err)
 	}
 
+	// Log active TLS mode so operators can confirm cert configuration on startup.
+	if cfg.SIP.OutboundTransport == "tls" {
+		log.Printf("SIP outbound transport: TLS proxy=%s:%d ca=%q cert=%q sni=%q insecure=%v",
+			cfg.SIP.OutboundProxyAddr, cfg.SIP.OutboundProxyPort,
+			cfg.SIP.TLSRootCAFile, cfg.SIP.TLSClientCertFile,
+			cfg.SIP.TLSServerName, cfg.SIP.TLSInsecureSkipVerify)
+	}
+	if cfg.SIP.SessionTimerEnabled {
+		log.Printf("SIP session-timer: enabled (RFC 4028, Min-SE=90 Session-Expires=1800)")
+	}
+
+	captureSpec := rootCfg.Spec.Capture
+	if captureSpec != nil && captureSpec.Enabled {
+		log.Printf("audio capture: enabled dir=%s", captureSpec.CaptureDirectory())
+	}
+
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
@@ -46,6 +70,8 @@ func main() {
 
 	router := sip.NewRouter(cm.Current)
 	sipSrv := sip.NewServer(cfg.SIP, router, cluster)
+	sipSrv.SetCaptureSpec(captureSpec)
+
 	apiSrv := api.NewServer(cfg.API, sipSrv, cfg.SIP, rootCfg, cm)
 
 	errCh := make(chan error, 2)

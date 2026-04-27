@@ -1,0 +1,127 @@
+apiVersion: sipbridge.io/v1alpha1
+kind: SIPBridgeConfig
+metadata:
+    name: default
+spec:
+    routes:
+        - match_user: "1000"
+          target_kind: bridge
+          target_id: room-1000
+    bridges:
+        - id: room-1000
+          name: Room 1000
+          type: ""
+          ring_timeout_seconds: 0
+          ddi_access_enabled: true
+          ddi_access_number: "1000"
+          participants: []
+          recording_enabled: true
+    conferenceGroups:
+        - id: conf-001
+          name: JPM Equities
+          type: mrd
+          ring_timeout_seconds: 30
+          winner_keep_ringing_seconds: 0
+          ddi_access_enabled: true
+          ddi_access_number: "1111"
+          sideA:
+            - id: a-1
+              display_name: A-1
+              sip_uri: sip:desk-a1@example.invalid
+              location: LDN
+            - id: a-2
+              display_name: A-2
+              sip_uri: sip:desk-a2@example.invalid
+              location: LDN
+            - id: a-3
+              display_name: A-3
+              sip_uri: sip:2000@192.168.1.41
+              location: ""
+            - id: a-4
+              display_name: A-4
+              sip_uri: sip:2000@127.0.0.1:5062
+              location: ""
+          sideB:
+            - id: b-1
+              display_name: B-1
+              sip_uri: sip:desk-b1@example.invalid
+              location: NYC
+            - id: b-2
+              display_name: B-2
+              sip_uri: sip:desk-b2@example.invalid
+              location: NYC
+            - id: b-3
+              display_name: B-3
+              sip_uri: sip:2003@192.168.1.94
+              location: ""
+          recording_enabled: true
+    hootGroups: []
+    users:
+        - id: u-1
+          display_name: Demo User
+          participant_id: "1234"
+          region: EMEA
+          allowed_bridge_ids:
+            - room-1000
+          allowed_conference_group_ids:
+            - conf-001
+          recording_opt_in: true
+          devices:
+            - id: dev-1
+              kind: ddi
+              address: 2000@127.0.0.1
+        - id: u-2
+          display_name: Demo2
+          participant_id: "5678"
+          region: EMEA
+          allowed_bridge_ids:
+            - room-1000
+          allowed_conference_group_ids:
+            - conf-001
+          recording_opt_in: true
+          devices:
+            - id: dev-1
+              kind: ddi
+              address: 2000@127.0.0.1
+    ivr:
+        entry_user: "9000"
+    sipStack:
+        bind_addr: 0.0.0.0
+        udp_port: 5060
+        outbound_transport: udp
+        tls_insecure_skip_verify: false
+        session_timer_enabled: false
+    servers:
+        - id: EMEA-1
+          name: EMEA-1
+          api_base_url: http://localhost:5173
+          region: EMEA
+    database:
+        config_storage: yaml
+    auth:
+        enabled: true
+        session_ttl_minutes: 480
+        local:
+            enabled: true
+            users:
+                - username: admin
+                  password: admin
+                  role: admin
+        adlds:
+            enabled: false
+    recording:
+        global_enabled: false
+        siprec:
+            enabled: false
+            trunks:
+                - id: default
+                  label: Default
+                  recorder_sip_uri: sip:recorder@127.0.0.1:5065
+            default_trunk_id: default
+            region_to_trunk:
+                EMEA: default
+    capture:
+        enabled: true
+        directory: D:/SIPBridgeArchive
+        capture_bridges: true
+        capture_conferences: true

@@ -10,10 +10,10 @@ import (
 )
 
 type RootConfig struct {
-	APIVersion string    `yaml:"apiVersion" json:"apiVersion"`
-	Kind       string    `yaml:"kind" json:"kind"`
-	Metadata   Metadata  `yaml:"metadata" json:"metadata"`
-	Spec       Spec      `yaml:"spec" json:"spec"`
+	APIVersion string   `yaml:"apiVersion" json:"apiVersion"`
+	Kind       string   `yaml:"kind" json:"kind"`
+	Metadata   Metadata `yaml:"metadata" json:"metadata"`
+	Spec       Spec     `yaml:"spec" json:"spec"`
 }
 
 type Metadata struct {
@@ -21,12 +21,12 @@ type Metadata struct {
 }
 
 type Spec struct {
-	Routes          []Route           `yaml:"routes" json:"routes"`
-	Bridges         []Bridge          `yaml:"bridges" json:"bridges"`
+	Routes           []Route           `yaml:"routes" json:"routes"`
+	Bridges          []Bridge          `yaml:"bridges" json:"bridges"`
 	ConferenceGroups []ConferenceGroup `yaml:"conferenceGroups" json:"conferenceGroups"`
-	HootGroups      []HootGroup       `yaml:"hootGroups" json:"hootGroups"`
-	Users           []User            `yaml:"users" json:"users"`
-	IVR             IVRConfig         `yaml:"ivr" json:"ivr"`
+	HootGroups       []HootGroup       `yaml:"hootGroups" json:"hootGroups"`
+	Users            []User            `yaml:"users" json:"users"`
+	IVR              IVRConfig         `yaml:"ivr" json:"ivr"`
 	// SIPStack persists SBC / TLS / listener overrides (merged with env at process start).
 	SIPStack *SIPStackSpec `yaml:"sipStack,omitempty" json:"sipStack,omitempty"`
 	// Servers lists other SIPBridge instances (API base URLs) for operations / probing.
@@ -37,6 +37,16 @@ type Spec struct {
 	Database *DatabaseSpec `yaml:"database,omitempty" json:"database,omitempty"`
 	// Recording holds global SIPREC / recorder integration (metadata and trunk hints).
 	Recording *RecordingSpec `yaml:"recording,omitempty" json:"recording,omitempty"`
+	// Capture controls local on-disk audio capture (WAV + metadata JSON per call).
+	Capture *CaptureSpec `yaml:"capture,omitempty" json:"capture,omitempty"`
+	// IPTVSources lists multicast RTP streams that can be injected into conference media.
+	IPTVSources []IPTVSourceSpec `yaml:"iptvSources,omitempty" json:"iptvSources,omitempty"`
+	// Auth configures local and AD LDS authentication + RBAC role mapping.
+	Auth *AuthSpec `yaml:"auth,omitempty" json:"auth,omitempty"`
+	// SIPTrunks are reusable outbound SBC/carrier profiles with optional per-trunk TLS certs.
+	SIPTrunks []SIPTrunkSpec `yaml:"sipTrunks,omitempty" json:"sipTrunks,omitempty"`
+	// DialPlan chooses outbound trunks based on target URI patterns.
+	DialPlan []DialPlanRule `yaml:"dialPlan,omitempty" json:"dialPlan,omitempty"`
 }
 
 // ManagedServer is a peer SIPBridge control-plane endpoint (not a SIP trunk).
@@ -58,7 +68,7 @@ type ManagedServer struct {
 }
 
 type Route struct {
-	MatchUser string `yaml:"match_user" json:"match_user"`
+	MatchUser  string `yaml:"match_user" json:"match_user"`
 	TargetKind string `yaml:"target_kind" json:"target_kind"`
 	TargetID   string `yaml:"target_id" json:"target_id"`
 }
@@ -71,20 +81,24 @@ type Bridge struct {
 	DDIAccessEnabled   bool          `yaml:"ddi_access_enabled" json:"ddi_access_enabled"`
 	DDIAccessNumber    string        `yaml:"ddi_access_number" json:"ddi_access_number"`
 	Participants       []Participant `yaml:"participants" json:"participants"`
+	// LineLabel is an optional SIPREC metadata label for this bridge (e.g. private wire / circuit id).
+	LineLabel string `yaml:"line_label,omitempty" json:"line_label,omitempty"`
+	// RecordingEnabled: nil = record when global SIPREC is on (legacy configs without key); false disables SIPREC for this bridge.
+	RecordingEnabled *bool `yaml:"recording_enabled,omitempty" json:"recording_enabled,omitempty"`
 }
 
 type User struct {
 	// ID is the primary identifier for the person (e.g. bank employee id). It is not auto-generated.
-	ID              string   `yaml:"id" json:"id"`
-	DisplayName     string   `yaml:"display_name" json:"display_name"`
-	ParticipantID   string   `yaml:"participant_id" json:"participant_id"`
+	ID            string `yaml:"id" json:"id"`
+	DisplayName   string `yaml:"display_name" json:"display_name"`
+	ParticipantID string `yaml:"participant_id" json:"participant_id"`
 	// Region is the caller's preferred region label (e.g. EMEA, LDN); used to order outbound ring targets
 	// to endpoints with the same Location / region first to reduce latency.
-	Region          string   `yaml:"region,omitempty" json:"region,omitempty"`
-	AllowedBridgeIDs []string `yaml:"allowed_bridge_ids" json:"allowed_bridge_ids"`
+	Region                    string   `yaml:"region,omitempty" json:"region,omitempty"`
+	AllowedBridgeIDs          []string `yaml:"allowed_bridge_ids" json:"allowed_bridge_ids"`
 	AllowedConferenceGroupIDs []string `yaml:"allowed_conference_group_ids" json:"allowed_conference_group_ids"`
-	// RecordingOptIn: when true, PIN dial-in legs may include SIPREC metadata if global recording is enabled.
-	RecordingOptIn bool `yaml:"recording_opt_in,omitempty" json:"recording_opt_in,omitempty"`
+	// RecordingOptIn: when true, SIPREC may run for this user's calls if conference/bridge-wide recording is off — requires IVR PIN match, or a conference endpoint linked_user_id whose SIP URI matches the caller.
+	RecordingOptIn bool         `yaml:"recording_opt_in,omitempty" json:"recording_opt_in,omitempty"`
 	Devices        []UserDevice `yaml:"devices,omitempty" json:"devices,omitempty"`
 }
 
@@ -100,27 +114,37 @@ type Participant struct {
 	End         string `yaml:"end" json:"end"`
 	Role        string `yaml:"role" json:"role"`
 	Location    string `yaml:"location" json:"location"`
+	// LineLabel overrides bridge LineLabel for this leg in SIPREC metadata (e.g. private wire label).
+	LineLabel string `yaml:"line_label,omitempty" json:"line_label,omitempty"`
 }
 
 type ConferenceGroup struct {
-	ID                 string     `yaml:"id" json:"id"`
-	Name               string     `yaml:"name" json:"name"`
-	Type               string     `yaml:"type,omitempty" json:"type,omitempty"`
-	RingTimeoutSeconds int        `yaml:"ring_timeout_seconds" json:"ring_timeout_seconds"`
-	WinnerKeepRingingSeconds int  `yaml:"winner_keep_ringing_seconds" json:"winner_keep_ringing_seconds"`
-	DDIAccessEnabled   bool       `yaml:"ddi_access_enabled" json:"ddi_access_enabled"`
-	DDIAccessNumber    string     `yaml:"ddi_access_number" json:"ddi_access_number"`
-	SideA              []Endpoint `yaml:"sideA" json:"sideA"`
-	SideB              []Endpoint `yaml:"sideB" json:"sideB"`
-	// RecordingEnabled: when true and global recording is on, sessions may fork to SIPREC for this group.
-	RecordingEnabled bool `yaml:"recording_enabled,omitempty" json:"recording_enabled,omitempty"`
+	ID                       string     `yaml:"id" json:"id"`
+	Name                     string     `yaml:"name" json:"name"`
+	Type                     string     `yaml:"type,omitempty" json:"type,omitempty"`
+	RingTimeoutSeconds       int        `yaml:"ring_timeout_seconds" json:"ring_timeout_seconds"`
+	WinnerKeepRingingSeconds int        `yaml:"winner_keep_ringing_seconds" json:"winner_keep_ringing_seconds"`
+	DDIAccessEnabled         bool       `yaml:"ddi_access_enabled" json:"ddi_access_enabled"`
+	DDIAccessNumber          string     `yaml:"ddi_access_number" json:"ddi_access_number"`
+	SideA                    []Endpoint `yaml:"sideA" json:"sideA"`
+	SideB                    []Endpoint `yaml:"sideB" json:"sideB"`
+	// LineLabel is optional SIPREC metadata (e.g. service / circuit label for this conference).
+	LineLabel string `yaml:"line_label,omitempty" json:"line_label,omitempty"`
+	// RecordingEnabled: nil = record when global SIPREC is on (same default as bridges; legacy configs without key); false disables SIPREC for this conference group.
+	RecordingEnabled *bool `yaml:"recording_enabled,omitempty" json:"recording_enabled,omitempty"`
+	// IPTVSourceIDs links multicast IPTV sources to this conference/hoot group.
+	IPTVSourceIDs []string `yaml:"iptv_source_ids,omitempty" json:"iptv_source_ids,omitempty"`
 }
 
 type HootGroup struct {
-	ID        string     `yaml:"id" json:"id"`
-	Name      string     `yaml:"name" json:"name"`
-	Talkers   []Endpoint `yaml:"talkers" json:"talkers"`
-	Listeners []Endpoint `yaml:"listeners" json:"listeners"`
+	ID                 string     `yaml:"id" json:"id"`
+	Name               string     `yaml:"name" json:"name"`
+	RingTimeoutSeconds int        `yaml:"ring_timeout_seconds" json:"ring_timeout_seconds"`
+	DDIAccessEnabled   bool       `yaml:"ddi_access_enabled" json:"ddi_access_enabled"`
+	DDIAccessNumber    string     `yaml:"ddi_access_number" json:"ddi_access_number"`
+	RecordingEnabled   *bool      `yaml:"recording_enabled,omitempty" json:"recording_enabled,omitempty"`
+	Talkers            []Endpoint `yaml:"talkers" json:"talkers"`
+	Listeners          []Endpoint `yaml:"listeners" json:"listeners"`
 }
 
 type Endpoint struct {
@@ -131,6 +155,8 @@ type Endpoint struct {
 	// LinkedUserID / LinkedDeviceID tie this leg to a user device for SIPREC CTI metadata.
 	LinkedUserID   string `yaml:"linked_user_id,omitempty" json:"linked_user_id,omitempty"`
 	LinkedDeviceID string `yaml:"linked_device_id,omitempty" json:"linked_device_id,omitempty"`
+	// LineLabel is optional SIPREC metadata for this conference endpoint (e.g. private wire leg).
+	LineLabel string `yaml:"line_label,omitempty" json:"line_label,omitempty"`
 }
 
 // ValidateManagedServers checks inventory entries for multi-server operations console.
@@ -199,6 +225,15 @@ func ApplyVersionedRootDefaults(root *RootConfig) {
 	if root.Spec.Servers == nil {
 		root.Spec.Servers = []ManagedServer{}
 	}
+	if root.Spec.IPTVSources == nil {
+		root.Spec.IPTVSources = []IPTVSourceSpec{}
+	}
+	if root.Spec.SIPTrunks == nil {
+		root.Spec.SIPTrunks = []SIPTrunkSpec{}
+	}
+	if root.Spec.DialPlan == nil {
+		root.Spec.DialPlan = []DialPlanRule{}
+	}
 	for i := range root.Spec.Users {
 		if root.Spec.Users[i].AllowedBridgeIDs == nil {
 			root.Spec.Users[i].AllowedBridgeIDs = []string{}
@@ -232,7 +267,7 @@ func LoadAppConfig(path string) (RootConfig, error) {
 
 	// Legacy compatibility: allow old-style top-level {routes, bridges}.
 	type legacy struct {
-		Routes  []struct {
+		Routes []struct {
 			MatchUser string `yaml:"match_user"`
 			BridgeID  string `yaml:"bridge_id"`
 		} `yaml:"routes"`

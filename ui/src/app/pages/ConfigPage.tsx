@@ -108,7 +108,12 @@ export default function ConfigPage() {
     setDraft((d) => {
       if (!d) return d
       const bridges = [...(d.spec.bridges ?? [])]
-      bridges.push({ id: `bridge-${String(bridges.length + 1).padStart(3, '0')}`, name: 'New Bridge', participants: [] })
+      bridges.push({
+        id: `bridge-${String(bridges.length + 1).padStart(3, '0')}`,
+        name: 'New Bridge',
+        participants: [],
+        recording_enabled: true
+      })
       return { ...d, spec: { ...d.spec, bridges } }
     })
   }
@@ -248,6 +253,7 @@ export default function ConfigPage() {
                     >
                       <option value="conferenceGroup">conferenceGroup</option>
                       <option value="bridge">bridge</option>
+                      <option value="hootGroup">hootGroup</option>
                     </select>
                   </td>
                   <td className="px-3 py-2">
@@ -314,6 +320,17 @@ export default function ConfigPage() {
                 value={b.name}
                 onChange={(e) => updateBridge(idx, { ...b, name: e.target.value })}
               />
+              <label
+                className="flex items-center gap-2 text-xs text-slate-300"
+                title="When off, SIPREC is not forked for this bridge (global recording must still be on)."
+              >
+                <input
+                  type="checkbox"
+                  checked={b.recording_enabled !== false}
+                  onChange={(e) => updateBridge(idx, { ...b, recording_enabled: e.target.checked })}
+                />
+                Record bridge calls
+              </label>
               <label className="flex items-center gap-2 text-xs text-slate-300">
                 <input
                   type="checkbox"

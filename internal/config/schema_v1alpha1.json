@@ -43,7 +43,9 @@
               "winner_keep_ringing_seconds": {"type": "integer", "minimum": 0, "maximum": 120},
               "ddi_access_enabled": {"type": "boolean"},
               "ddi_access_number": {"type": "string"},
+              "line_label": {"type": "string"},
               "recording_enabled": {"type": "boolean"},
+              "iptv_source_ids": {"type": "array", "items": {"type": "string"}},
               "sideA": {"$ref": "#/$defs/endpoints"},
               "sideB": {"$ref": "#/$defs/endpoints"}
             },
@@ -58,6 +60,10 @@
             "properties": {
               "id": {"type": "string"},
               "name": {"type": "string"},
+              "ring_timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 120},
+              "ddi_access_enabled": {"type": "boolean"},
+              "ddi_access_number": {"type": "string"},
+              "recording_enabled": {"type": "boolean"},
               "talkers": {"$ref": "#/$defs/endpoints"},
               "listeners": {"$ref": "#/$defs/endpoints"}
             },
@@ -76,6 +82,8 @@
               "ring_timeout_seconds": {"type": "integer"},
               "ddi_access_enabled": {"type": "boolean"},
               "ddi_access_number": {"type": "string"},
+              "line_label": {"type": "string"},
+              "recording_enabled": {"type": "boolean"},
               "participants": {"type": "array"}
             },
             "additionalProperties": true
@@ -202,6 +210,114 @@
             }
           },
           "additionalProperties": false
+        },
+        "capture": {
+          "type": "object",
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "directory": {"type": "string"},
+            "capture_bridges": {"type": "boolean"},
+            "capture_conferences": {"type": "boolean"}
+          },
+          "additionalProperties": false
+        },
+        "iptvSources": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "multicast_ip", "port"],
+            "properties": {
+              "id": {"type": "string"},
+              "name": {"type": "string"},
+              "multicast_ip": {"type": "string"},
+              "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+              "payload_type": {"type": "integer", "minimum": 0, "maximum": 127},
+              "extract_audio_from_video": {"type": "boolean"},
+              "jitter_buffer_ms": {"type": "integer", "minimum": 0, "maximum": 5000},
+              "enabled": {"type": "boolean"}
+            },
+            "additionalProperties": false
+          }
+        },
+        "auth": {
+          "type": "object",
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "session_ttl_minutes": {"type": "integer", "minimum": 1, "maximum": 43200},
+            "local": {
+              "type": "object",
+              "properties": {
+                "enabled": {"type": "boolean"},
+                "users": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "required": ["username", "password", "role"],
+                    "properties": {
+                      "username": {"type": "string"},
+                      "password": {"type": "string"},
+                      "role": {"type": "string", "enum": ["admin", "operator", "readonly"]}
+                    },
+                    "additionalProperties": false
+                  }
+                }
+              },
+              "additionalProperties": false
+            },
+            "adlds": {
+              "type": "object",
+              "properties": {
+                "enabled": {"type": "boolean"},
+                "url": {"type": "string"},
+                "bind_dn": {"type": "string"},
+                "bind_password_env_var": {"type": "string"},
+                "base_dn": {"type": "string"},
+                "user_filter": {"type": "string"},
+                "group_role_map": {
+                  "type": "object",
+                  "additionalProperties": {"type": "string", "enum": ["admin", "operator", "readonly"]}
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        },
+        "sipTrunks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "proxy_addr", "proxy_port"],
+            "properties": {
+              "id": {"type": "string"},
+              "name": {"type": "string"},
+              "proxy_addr": {"type": "string"},
+              "proxy_port": {"type": "integer", "minimum": 1, "maximum": 65535},
+              "transport": {"type": "string", "enum": ["udp", "tls"]},
+              "tls_root_ca_file": {"type": "string"},
+              "tls_client_cert_file": {"type": "string"},
+              "tls_client_key_file": {"type": "string"},
+              "tls_insecure_skip_verify": {"type": "boolean"},
+              "tls_server_name": {"type": "string"}
+            },
+            "additionalProperties": false
+          }
+        },
+        "dialPlan": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "target_trunk_id"],
+            "properties": {
+              "id": {"type": "string"},
+              "enabled": {"type": "boolean"},
+              "user_prefix": {"type": "string"},
+              "domain": {"type": "string"},
+              "uri_regex": {"type": "string"},
+              "target_trunk_id": {"type": "string"}
+            },
+            "additionalProperties": false
+          }
         }
       },
       "additionalProperties": true
@@ -219,7 +335,8 @@
           "sip_uri": {"type": "string"},
           "location": {"type": "string"},
           "linked_user_id": {"type": "string"},
-          "linked_device_id": {"type": "string"}
+          "linked_device_id": {"type": "string"},
+          "line_label": {"type": "string"}
         },
         "additionalProperties": false
       }

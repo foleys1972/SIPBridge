@@ -19,14 +19,16 @@ type InviteTargetKind string
 const (
 	InviteTargetKindBridge          InviteTargetKind = "bridge"
 	InviteTargetKindConferenceGroup InviteTargetKind = "conferenceGroup"
+	InviteTargetKindHootGroup       InviteTargetKind = "hootGroup"
 	InviteTargetKindIVR             InviteTargetKind = "ivr"
 )
 
 type InviteTarget struct {
 	Kind InviteTargetKind
 
-	Bridge config.Bridge
-	Group  config.ConferenceGroup
+	Bridge    config.Bridge
+	Group     config.ConferenceGroup
+	HootGroup config.HootGroup
 }
 
 func (r *Router) CurrentConfig() config.RootConfig {
@@ -62,6 +64,12 @@ func (r *Router) MatchInvite(msg *Message) (t InviteTarget, ok bool) {
 					return InviteTarget{}, false
 				}
 				return InviteTarget{Kind: InviteTargetKindConferenceGroup, Group: g}, true
+			case string(InviteTargetKindHootGroup):
+				g, ok := hootGroupByID(cfg, rt.TargetID)
+				if !ok {
+					return InviteTarget{}, false
+				}
+				return InviteTarget{Kind: InviteTargetKindHootGroup, HootGroup: g}, true
 			case string(InviteTargetKindBridge):
 				fallthrough
 			default:
@@ -94,6 +102,15 @@ func conferenceGroupByID(cfg config.RootConfig, id string) (config.ConferenceGro
 		}
 	}
 	return config.ConferenceGroup{}, false
+}
+
+func hootGroupByID(cfg config.RootConfig, id string) (config.HootGroup, bool) {
+	for _, g := range cfg.Spec.HootGroups {
+		if g.ID == id {
+			return g, true
+		}
+	}
+	return config.HootGroup{}, false
 }
 
 func ExtractUserFromURI(uri string) string {

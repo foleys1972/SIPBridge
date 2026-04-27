@@ -26,10 +26,13 @@ func BuildOutboundInviteSIPREC(targetURI, viaHost string, viaPort int, viaTx SIP
 	fmt.Fprintf(&body, "--%s\r\n", boundary)
 	body.WriteString("Content-Type: application/sdp\r\n")
 	body.WriteString("Content-Disposition: session\r\n\r\n")
-	body.WriteString(sdp)
+	// One CRLF after SDP; sdp must not end with an extra blank line or payload-parser.js
+	// /^([^]+)(m=[^]+?)(m=[^]+?)$/ fails (arr null → Cannot read properties of null).
+	sdpBody := strings.TrimRight(sdp, "\r\n")
+	body.WriteString(sdpBody)
 	body.WriteString("\r\n")
 	fmt.Fprintf(&body, "--%s\r\n", boundary)
-	body.WriteString("Content-Type: application/xml; charset=UTF-8\r\n")
+	body.WriteString("Content-Type: application/rs-metadata+xml; charset=UTF-8\r\n")
 	body.WriteString("Content-Disposition: recording-session\r\n\r\n")
 	body.WriteString(metadataXML)
 	body.WriteString("\r\n")

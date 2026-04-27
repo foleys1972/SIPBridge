@@ -9,9 +9,14 @@ import BridgeUsageDetailPage from './pages/BridgeUsageDetailPage'
 import ConfigPage from './pages/ConfigPage'
 import ConferenceSettingsPage from './pages/ConferenceSettingsPage'
 import UserListPage from './pages/UserListPage'
+import AuthUsersPage from './pages/AuthUsersPage'
 import UserDetailPage from './pages/UserDetailPage'
 import DatabaseSettingsPage from './pages/DatabaseSettingsPage'
 import RecordingSettingsPage from './pages/RecordingSettingsPage'
+import StackHealthPage from './pages/StackHealthPage'
+import IPTVSettingsPage from './pages/IPTVSettingsPage'
+import CaptureSettingsPage from './pages/CaptureSettingsPage'
+import TrunksDialPlanPage from './pages/TrunksDialPlanPage'
 import SettingsLayout from './settings/SettingsLayout'
 import SbcSetupPage from './pages/SbcSetupPage'
 import ServersPage from './pages/ServersPage'
@@ -47,10 +52,15 @@ export default function App() {
           <Route index element={<Navigate to="/settings/config" replace />} />
           <Route path="config" element={<ConfigPage />} />
           <Route path="users" element={<UserListPage />} />
+          <Route path="auth-users" element={<AuthUsersPage />} />
           <Route path="users/:userId" element={<UserDetailPage />} />
           <Route path="conference" element={<ConferenceSettingsPage />} />
           <Route path="database" element={<DatabaseSettingsPage />} />
           <Route path="recording" element={<RecordingSettingsPage />} />
+          <Route path="trunks" element={<TrunksDialPlanPage />} />
+          <Route path="capture" element={<CaptureSettingsPage />} />
+          <Route path="iptv" element={<IPTVSettingsPage />} />
+          <Route path="stack-health" element={<StackHealthPage />} />
         </Route>
         <Route
           path="/setup/sbc"

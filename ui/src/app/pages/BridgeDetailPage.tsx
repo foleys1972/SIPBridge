@@ -3,14 +3,16 @@ import { Link, useParams } from 'react-router-dom'
 import { apiFetch, apiPostText } from '../api/client'
 import type { Bridge, BridgeCallInfo, RootConfig } from '../api/types'
 import { employeeIdFromCall } from '../lib/employeeId'
+import { useAuth } from '../auth/AuthContext'
 import Badge from '../components/Badge'
-import RequireRole from '../auth/RequireRole'
 
 type CallsResponse = { bridge_id: string; calls: BridgeCallInfo[] }
 
 export default function BridgeDetailPage() {
   const params = useParams()
   const bridgeId = params.bridgeId ?? ''
+  const { role } = useAuth()
+  const canAct = role === 'admin' || role === 'operator'
 
   const [cfg, setCfg] = useState<RootConfig | null>(null)
   const [calls, setCalls] = useState<BridgeCallInfo[]>([])
@@ -88,6 +90,13 @@ export default function BridgeDetailPage() {
               <div className="text-xs text-slate-500">Configured participants</div>
               <div className="text-slate-200">{bridge.participants?.length ?? 0}</div>
             </div>
+            <div>
+              <div className="text-xs text-slate-500">Record bridge calls</div>
+              <div className="text-slate-200">
+                {bridge.recording_enabled === false ? 'Off' : 'On'}{' '}
+                <span className="text-xs text-slate-500">(edit under Configuration → Bridges)</span>
+              </div>
+            </div>
           </div>
         </div>
       ) : null}
@@ -99,11 +108,14 @@ export default function BridgeDetailPage() {
       {status ? <div className="mt-4 text-sm text-slate-400">{status}</div> : null}
 
       <section className="mt-6 rounded-xl border border-slate-800 bg-slate-950 p-4">
-        <div className="flex items-center justify-between">
+        <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="text-sm font-semibold">Active Connections</div>
+          {!canAct ? (
+            <span className="text-xs text-slate-500">Switch role to operator or admin to drop calls.</span>
+          ) : null}
         </div>
-        <div className="mt-3 overflow-hidden rounded-lg border border-slate-800">
-          <table className="w-full text-left text-sm">
+        <div className="mt-3 overflow-x-auto rounded-lg border border-slate-800">
+          <table className="w-full min-w-[900px] text-left text-sm">
             <thead className="bg-slate-900 text-xs text-slate-400">
               <tr>
                 <th className="px-3 py-2">Employee ID</th>
@@ -113,7 +125,9 @@ export default function BridgeDetailPage() {
                 <th className="px-3 py-2">Remote</th>
                 <th className="px-3 py-2">Call-ID</th>
                 <th className="px-3 py-2">Started</th>
-                <th className="px-3 py-2"></th>
+                <th className="sticky right-0 z-10 bg-slate-900 px-3 py-2 text-right shadow-[-8px_0_12px_-4px_rgba(0,0,0,0.4)]">
+                  Actions
+                </th>
               </tr>
             </thead>
             <tbody>
@@ -128,15 +142,18 @@ export default function BridgeDetailPage() {
                   <td className="px-3 py-2 font-mono text-xs text-slate-300">{c.remote_addr}</td>
                   <td className="px-3 py-2 font-mono text-xs text-slate-300">{c.call_id}</td>
                   <td className="px-3 py-2 text-slate-300">{new Date(c.created_at).toLocaleString()}</td>
-                  <td className="px-3 py-2 text-right">
-                    <RequireRole allow={['admin', 'operator']}>
+                  <td className="sticky right-0 z-10 border-l border-slate-800/80 bg-slate-950 px-3 py-2 text-right">
+                    {canAct ? (
                       <button
+                        type="button"
                         className="rounded-md border border-rose-900/60 bg-rose-950 px-2 py-1 text-xs text-rose-200 hover:bg-rose-900/30"
                         onClick={() => drop(c)}
                       >
                         Drop
                       </button>
-                    </RequireRole>
+                    ) : (
+                      <span className="text-xs text-slate-600">—</span>
+                    )}
                   </td>
                 </tr>
               ))}

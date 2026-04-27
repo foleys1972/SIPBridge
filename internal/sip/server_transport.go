@@ -8,7 +8,6 @@ import (
 	"net"
 	"strconv"
 	"strings"
-
 )
 
 func (s *Server) dialOutboundTLS() (*tls.Conn, error) {
@@ -17,6 +16,13 @@ func (s *Server) dialOutboundTLS() (*tls.Conn, error) {
 	}
 	addr := net.JoinHostPort(s.cfg.OutboundProxyAddr, strconv.Itoa(s.cfg.OutboundProxyPort))
 	return tls.Dial("tcp", addr, s.tlsClient)
+}
+
+func dialOutboundTLSWithConfig(addr string, tc *tls.Config) (*tls.Conn, error) {
+	if tc == nil {
+		return nil, fmt.Errorf("TLS config is nil")
+	}
+	return tls.Dial("tcp", addr, tc)
 }
 
 func (s *Server) writeLegOutbound(leg *fanoutLeg, msg []byte) error {
@@ -28,6 +34,10 @@ func (s *Server) writeLegOutbound(leg *fanoutLeg, msg []byte) error {
 	}
 	if s.udpConn == nil {
 		return fmt.Errorf("no UDP conn")
+	}
+	if leg.outboundUDP != nil {
+		_, err := s.udpConn.WriteToUDP(msg, leg.outboundUDP)
+		return err
 	}
 	dst := s.outboundDestForTarget(leg.targetURI, nil)
 	if dst == nil {
@@ -117,13 +127,40 @@ func (s *Server) readTLSConnResponses(c net.Conn) {
 // emitOutboundInvite sends one INVITE leg (UDP to target or TLS to configured SBC proxy).
 func (s *Server) emitOutboundInvite(sessionKey string, targetURI string, sdp string, rtp *rtpSession, localIP string, localPort int) (*fanoutLeg, error) {
 	extra := OutboundExtraHeaders{SessionTimer: s.cfg.SessionTimerEnabled}
+	route := s.selectTrunkForTarget(targetURI)
 	useTLS := s.cfg.OutboundTransport == "tls" && s.outboundDest(nil) != nil
+	tlsClient := s.tlsClient
+	tlsAddr := net.JoinHostPort(s.cfg.OutboundProxyAddr, strconv.Itoa(s.cfg.OutboundProxyPort))
+
+	if route.trunk != nil {
+		trTx := strings.ToLower(strings.TrimSpace(route.trunk.Transport))
+		if trTx == "" {
+			trTx = "udp"
+		}
+		if trTx == "tls" {
+			useTLS = true
+			tlsAddr = net.JoinHostPort(strings.TrimSpace(route.trunk.ProxyAddr), strconv.Itoa(route.trunk.ProxyPort))
+			tc, err := NewTLSClientConfigValues(
+				strings.TrimSpace(route.trunk.TLSServerName),
+				strings.TrimSpace(route.trunk.TLSRootCAFile),
+				strings.TrimSpace(route.trunk.TLSClientCertFile),
+				strings.TrimSpace(route.trunk.TLSClientKeyFile),
+				route.trunk.TLSInsecureSkipVerify,
+			)
+			if err != nil {
+				return nil, err
+			}
+			tlsClient = tc
+		} else {
+			useTLS = false
+		}
+	}
 
 	if useTLS {
-		if s.tlsClient == nil {
+		if tlsClient == nil {
 			return nil, fmt.Errorf("outbound TLS not configured")
 		}
-		tlsConn, err := s.dialOutboundTLS()
+		tlsConn, err := dialOutboundTLSWithConfig(tlsAddr, tlsClient)
 		if err != nil {
 			return nil, err
 		}
@@ -140,6 +177,12 @@ func (s *Server) emitOutboundInvite(sessionKey string, targetURI string, sdp str
 			fromTag:      out.FromTag,
 			outboundConn: tlsConn,
 			viaTransport: ViaTLS,
+			trunkID: func() string {
+				if route.trunk != nil {
+					return strings.TrimSpace(route.trunk.ID)
+				}
+				return ""
+			}(),
 			localViaHost: localIP,
 			localViaPort: localPort,
 			rtp:          rtp,
@@ -163,6 +206,12 @@ func (s *Server) emitOutboundInvite(sessionKey string, targetURI string, sdp str
 		branch:       out.Branch,
 		fromTag:      out.FromTag,
 		viaTransport: ViaUDP,
+		trunkID: func() string {
+			if route.trunk != nil {
+				return strings.TrimSpace(route.trunk.ID)
+			}
+			return ""
+		}(),
 		localViaHost: localIP,
 		localViaPort: localPort,
 		rtp:          rtp,
@@ -170,10 +219,14 @@ func (s *Server) emitOutboundInvite(sessionKey string, targetURI string, sdp str
 	if s.udpConn == nil {
 		return nil, fmt.Errorf("no UDP conn")
 	}
-	dst := s.outboundDestForTarget(out.Target, nil)
+	dst := route.udpDest
+	if dst == nil {
+		dst = s.outboundDestForTarget(out.Target, nil)
+	}
 	if dst == nil {
 		return nil, fmt.Errorf("unroutable %s", out.Target)
 	}
+	leg.outboundUDP = dst
 	if _, err := s.udpConn.WriteToUDP(out.Bytes, dst); err != nil {
 		return nil, err
 	}

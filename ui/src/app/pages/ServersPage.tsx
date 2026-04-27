@@ -236,7 +236,7 @@ export default function ServersPage() {
                             className="min-w-[14rem] rounded border border-slate-800 bg-slate-950 px-2 py-1 font-mono text-xs text-slate-100"
                             value={s.api_base_url}
                             onChange={(e) => updateRow(i, { ...s, api_base_url: e.target.value })}
-                            placeholder="http://10.0.0.5:8080"
+                            placeholder="http://10.0.0.5:8081"
                           />
                         </td>
                         <td className="px-3 py-2 align-top">

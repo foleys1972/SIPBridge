@@ -3,35 +3,44 @@ package sip
 import (
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 	"fmt"
 	"log"
+	"math/rand"
 	"net"
 	"net/url"
+	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"sipbridge/internal/capture"
 	"sipbridge/internal/config"
+	"sipbridge/internal/iptv"
 )
 
 type Server struct {
-	cfg config.SIPConfig
+	cfg    config.SIPConfig
 	router *Router
 
 	cluster config.ClusterLimits
 
 	tlsClient *tls.Config
 
-	sessionMu sync.Mutex
-	sessions  map[string]*fanoutSession
-	legsByCallID map[string]*fanoutLeg
+	sessionMu       sync.Mutex
+	sessions        map[string]*fanoutSession
+	legsByCallID    map[string]*fanoutLeg
 	ivrConfSessions map[string]*ivrConferenceFanoutSession
-	bridgeCalls map[string]map[string]*bridgeCall
-	ivrSessions map[string]*ivrSession
+	bridgeCalls     map[string]map[string]*bridgeCall
+	ivrSessions     map[string]*ivrSession
 
 	// siprecRecordings maps logical session keys (see siprec_ctrl.go) to outbound SIPREC INVITE legs.
 	siprecRecordings map[string]*fanoutLeg
+
+	captureSpec *config.CaptureSpec
+	iptvSubs    map[string]*iptvSubscription
 
 	mu           sync.RWMutex
 	started      bool
@@ -39,6 +48,21 @@ type Server struct {
 	packetsRx    uint64
 	bytesRx      uint64
 	lastPacketAt time.Time
+}
+
+type iptvSubscription struct {
+	SourceID string
+	CloseFn  func()
+	Metrics  *IPTVSubscriptionMetrics
+}
+
+type IPTVSubscriptionMetrics struct {
+	SourceID       string    `json:"source_id"`
+	Running        bool      `json:"running"`
+	AudioPackets   uint64    `json:"audio_packets"`
+	DroppedPackets uint64    `json:"dropped_packets"`
+	LastAudioAt    time.Time `json:"last_audio_at,omitempty"`
+	StartedAt      time.Time `json:"started_at,omitempty"`
 }
 
 func (s *Server) ivrStartConferenceGroupFanout(ivrKey string, sess *ivrSession) {
@@ -65,7 +89,9 @@ func (s *Server) ivrStartConferenceGroupFanout(ivrKey string, sess *ivrSession) 
 	}
 	log.Printf("IVR conferenceGroup fanout: start key=%s group_id=%s caller_side=%s", ivrKey, groupID, callerSide)
 	var ring []config.Endpoint
-	if callerSide == "A" {
+	if isHOOTGroup(g) {
+		ring = append(append([]config.Endpoint(nil), g.SideA...), g.SideB...)
+	} else if callerSide == "A" {
 		ring = append([]config.Endpoint(nil), g.SideB...)
 	} else {
 		ring = append([]config.Endpoint(nil), g.SideA...)
@@ -192,22 +218,112 @@ type fanoutLeg struct {
 	sessionKey string
 	targetURI  string
 
-	callID  string
-	branch  string
-	fromTag string
+	callID   string
+	branch   string
+	fromTag  string
 	toHeader string
 	// siprecByeURI is the Request-URI for BYE (Contact from 200 OK) for SIPREC legs.
 	siprecByeURI string
 
 	// Outbound TLS (or TCP) to SBC; UDP legs use nil and send via udpConn + outboundDest.
 	outboundConn net.Conn
+	outboundUDP  *net.UDPAddr
 	viaTransport SIPViaTransport
+	trunkID      string
 	localViaHost string
 	localViaPort int
 
 	rtp *rtpSession
 
 	finalStatus int
+}
+
+type trunkRouteDecision struct {
+	trunk   *config.SIPTrunkSpec
+	udpDest *net.UDPAddr
+}
+
+func ruleEnabled(v *bool) bool {
+	if v == nil {
+		return true
+	}
+	return *v
+}
+
+func parseSIPUserDomain(rawURI string) (user, domain string) {
+	u := strings.TrimSpace(rawURI)
+	u = strings.TrimPrefix(u, "<")
+	u = strings.TrimSuffix(u, ">")
+	l := strings.ToLower(u)
+	if strings.HasPrefix(l, "sip:") {
+		u = u[4:]
+	} else if strings.HasPrefix(l, "sips:") {
+		u = u[5:]
+	}
+	if i := strings.IndexAny(u, ";?"); i >= 0 {
+		u = u[:i]
+	}
+	if at := strings.LastIndex(u, "@"); at >= 0 {
+		user = strings.TrimSpace(u[:at])
+		u = u[at+1:]
+	}
+	if h, _, err := net.SplitHostPort(u); err == nil {
+		domain = strings.Trim(strings.TrimSpace(h), "[]")
+		return user, domain
+	}
+	domain = strings.Trim(strings.TrimSpace(u), "[]")
+	return user, domain
+}
+
+func (s *Server) selectTrunkForTarget(targetURI string) trunkRouteDecision {
+	if s == nil || s.router == nil {
+		return trunkRouteDecision{}
+	}
+	cfg := s.router.CurrentConfig()
+	if len(cfg.Spec.SIPTrunks) == 0 || len(cfg.Spec.DialPlan) == 0 {
+		return trunkRouteDecision{}
+	}
+	byID := make(map[string]*config.SIPTrunkSpec, len(cfg.Spec.SIPTrunks))
+	for i := range cfg.Spec.SIPTrunks {
+		t := &cfg.Spec.SIPTrunks[i]
+		if strings.TrimSpace(t.ID) == "" {
+			continue
+		}
+		byID[strings.TrimSpace(t.ID)] = t
+	}
+	user, domain := parseSIPUserDomain(targetURI)
+	uri := strings.TrimSpace(targetURI)
+	for _, r := range cfg.Spec.DialPlan {
+		if !ruleEnabled(r.Enabled) {
+			continue
+		}
+		ok := true
+		if p := strings.TrimSpace(r.UserPrefix); p != "" && !strings.HasPrefix(user, p) {
+			ok = false
+		}
+		if d := strings.TrimSpace(r.Domain); d != "" && !strings.EqualFold(d, domain) {
+			ok = false
+		}
+		if rx := strings.TrimSpace(r.URIRegex); rx != "" {
+			re, err := regexp.Compile(rx)
+			if err != nil || !re.MatchString(uri) {
+				ok = false
+			}
+		}
+		if !ok {
+			continue
+		}
+		t := byID[strings.TrimSpace(r.TargetTrunkID)]
+		if t == nil {
+			continue
+		}
+		ip := net.ParseIP(strings.TrimSpace(t.ProxyAddr))
+		if ip == nil || t.ProxyPort <= 0 || t.ProxyPort > 65535 {
+			continue
+		}
+		return trunkRouteDecision{trunk: t, udpDest: &net.UDPAddr{IP: ip, Port: t.ProxyPort}}
+	}
+	return trunkRouteDecision{}
 }
 
 type bridgeCall struct {
@@ -222,15 +338,30 @@ type bridgeCall struct {
 
 	contactURI string
 
-	remote *net.UDPAddr
+	remote    *net.UDPAddr
 	createdAt time.Time
 
 	// Set when the leg joined via IVR dial-in authorization (participant PIN).
 	userID          string
 	userDisplayName string
 	pinLen          int
+	// participantPIN is the raw IVR participant_id digits (SIPREC metadata).
+	participantPIN string
+	// lineLabel is SIPREC metadata for private wire / circuit (from bridge or conference config).
+	lineLabel string
 
 	rtp *rtpSession
+	// peerRtp is the far-end RTP leg (fanout winner) when bridge media relay is active.
+	peerRtp *rtpSession
+	// cap is the local audio capture for this bridge call (nil if capture disabled).
+	cap *capture.CallCapture
+
+	siprecFwdMu   sync.Mutex
+	siprecFwdConn *net.UDPConn
+	siprecFwdDst0 *net.UDPAddr // inbound caller -> SIPREC first leg
+	siprecFwdDst1 *net.UDPAddr // peer -> SIPREC second leg
+	// siprecSilenceStop stops PCMU silence sent to siprecFwdDst1 when only the inbound leg has RTP.
+	siprecSilenceStop chan struct{}
 }
 
 type Stats struct {
@@ -242,15 +373,24 @@ type Stats struct {
 
 func NewServer(cfg config.SIPConfig, router *Router, cluster config.ClusterLimits) *Server {
 	return &Server{
-		cfg:         cfg,
-		router:      router,
-		cluster:     cluster,
-		sessions:    make(map[string]*fanoutSession),
-		legsByCallID: make(map[string]*fanoutLeg),
-		ivrConfSessions: make(map[string]*ivrConferenceFanoutSession),
-		bridgeCalls: make(map[string]map[string]*bridgeCall),
-		ivrSessions: make(map[string]*ivrSession),
+		cfg:              cfg,
+		router:           router,
+		cluster:          cluster,
+		sessions:         make(map[string]*fanoutSession),
+		legsByCallID:     make(map[string]*fanoutLeg),
+		ivrConfSessions:  make(map[string]*ivrConferenceFanoutSession),
+		bridgeCalls:      make(map[string]map[string]*bridgeCall),
+		ivrSessions:      make(map[string]*ivrSession),
 		siprecRecordings: make(map[string]*fanoutLeg),
+		iptvSubs:         make(map[string]*iptvSubscription),
+	}
+}
+
+// SetCaptureSpec enables local audio capture for bridge and conference calls.
+// Must be called before Start.
+func (s *Server) SetCaptureSpec(spec *config.CaptureSpec) {
+	if s != nil {
+		s.captureSpec = spec
 	}
 }
 
@@ -342,48 +482,54 @@ func (s *Server) tryRejectInviteForCapacity(msg *Message, conn *net.UDPConn, rem
 type ivrState string
 
 const (
-	ivrStateCollectBridge ivrState = "collect_bridge"
-	ivrStateCollectUser   ivrState = "collect_user"
-	ivrStateJoined        ivrState = "joined"
+	ivrStateCollectBridge         ivrState = "collect_bridge"
+	ivrStateCollectUser           ivrState = "collect_user"
+	ivrStateJoined                ivrState = "joined"
 	ivrStateJoinedConferenceGroup ivrState = "joined_conference_group"
 )
 
 type ivrSession struct {
 	key string
 
-	remote *net.UDPAddr
+	remote     *net.UDPAddr
 	fromHeader string
 	toHeader   string
 	contactURI string
-	createdAt time.Time
+	createdAt  time.Time
 
-	state ivrState
-	buf   strings.Builder
-	bridgeAccess string
-	participantID string
-	conferenceGroupID string
-	conferenceGroupType string
+	state                ivrState
+	buf                  strings.Builder
+	bridgeAccess         string
+	participantID        string
+	conferenceGroupID    string
+	conferenceGroupType  string
 	conferenceCallerSide string
 	// preferredRegion is set after IVR PIN auth from User.region; used to order outbound ring targets.
 	preferredRegion string
 
-	rtp *rtpSession
+	rtp        *rtpSession
 	dtmfViaRTP bool
+
+	siprecFwdMu   sync.Mutex
+	siprecFwdConn *net.UDPConn
+	siprecFwdDst0 *net.UDPAddr
+	siprecFwdDst1 *net.UDPAddr
 }
 
 type ivrConferenceFanoutSession struct {
-	key string
-	ivrKey string
-	groupID string
-	callerSide string
-	inboundBC sipBackchannel
-	createdAt time.Time
-	ringTimeout time.Duration
+	key               string
+	ivrKey            string
+	groupID           string
+	callerSide        string
+	inboundBC         sipBackchannel
+	createdAt         time.Time
+	ringTimeout       time.Duration
 	winnerKeepRinging time.Duration
-	legs []*fanoutLeg
-	winnerCallID string
-	terminated bool
-	rtp *rtpSession
+	legs              []*fanoutLeg
+	winnerCallID      string
+	terminated        bool
+	rtp               *rtpSession
+	cap               *capture.CallCapture
 }
 
 func (s *Server) enforceIVRConfRingTimeout(fanKey string, d time.Duration) {
@@ -401,9 +547,13 @@ func (s *Server) enforceIVRConfRingTimeout(fanKey string, d time.Duration) {
 			return
 		}
 		fs.terminated = true
+		cap := fs.cap
 		legs := append([]*fanoutLeg(nil), fs.legs...)
 		s.sessionMu.Unlock()
 
+		if cap != nil {
+			cap.Close()
+		}
 		for _, l := range legs {
 			li, lp := s.localViaForLeg(l)
 			cancel := BuildOutboundCancel(l.targetURI, li, lp, l.callID, l.branch, l.fromTag, l.viaTransport)
@@ -693,9 +843,16 @@ func (s *Server) DropBridgeCall(bridgeID, callID, fromTag string) error {
 	s.sessionMu.Lock()
 	byBridge = s.bridgeCalls[bridgeID]
 	if byBridge != nil {
-		if c2, ok := byBridge[key]; ok && c2 != nil && c2.rtp != nil {
-			c2.rtp.Close()
-			c2.rtp = nil
+		if c2, ok := byBridge[key]; ok && c2 != nil {
+			if c2.rtp != nil {
+				c2.rtp.Close()
+				c2.rtp = nil
+			}
+			if c2.peerRtp != nil {
+				c2.peerRtp.Close()
+				c2.peerRtp = nil
+			}
+			s.clearBridgeSIPRECForwarding(c2)
 		}
 		delete(byBridge, key)
 		if len(byBridge) == 0 {
@@ -789,7 +946,7 @@ func (s *Server) Start(ctx context.Context) error {
 			// SIPBridge currently doesn't act as a registrar, but many softphones will attempt to REGISTER.
 			// Return 200 OK so the client can proceed with calls in lab setups.
 			extra := map[string]string{
-				"Allow":  "INVITE, ACK, BYE, CANCEL, OPTIONS, INFO, REFER, REGISTER",
+				"Allow":   "INVITE, ACK, BYE, CANCEL, OPTIONS, INFO, REFER, REGISTER",
 				"Expires": "0",
 			}
 			resp, _ := BuildResponse(msg, 200, "OK", extra, nil)
@@ -877,45 +1034,54 @@ func (s *Server) Start(ctx context.Context) error {
 				offer, okOffer := parseSDPAudioOffer(string(msg.Body), remote.IP)
 				var rtpSess *rtpSession
 				rtpPort := 0
-				if okOffer && offer.HasPCMU {
-					pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
-					if err == nil {
-						telPT := uint8(0)
-						if offer.TelephoneEventPT > 0 && offer.TelephoneEventPT < 128 {
-							telPT = uint8(offer.TelephoneEventPT)
-						}
-						remoteRTPIP := offer.Addr
-						if remote != nil && remote.IP != nil && !remote.IP.IsUnspecified() {
-							remoteRTPIP = remote.IP
-						}
-						rtpSess = newRTPSession(pc, &net.UDPAddr{IP: remoteRTPIP, Port: offer.Port}, 0, telPT, func(d string) {
-							parts := strings.SplitN(sessKey, "|", 2)
-							callID := ""
-							fromTag := ""
-							if len(parts) == 2 {
-								callID = parts[0]
-								fromTag = parts[1]
+				audioPT := uint8(0)
+				if okOffer {
+					if pt, ok := pickIVRAudioPayloadType(offer); ok {
+						audioPT = pt
+						pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+						if err == nil {
+							telPT := uint8(0)
+							if offer.TelephoneEventPT > 0 && offer.TelephoneEventPT < 128 {
+								telPT = uint8(offer.TelephoneEventPT)
 							}
-							s.sessionMu.Lock()
-							sess := s.ivrSessions[sessKey]
-							if sess != nil {
-								s.handleIVRDigitLocked(sessKey, sess, d, callID, fromTag)
+							remoteRTPIP := offer.Addr
+							if remote != nil && remote.IP != nil && !remote.IP.IsUnspecified() {
+								remoteRTPIP = remote.IP
 							}
-							s.sessionMu.Unlock()
-						})
-						rtpSess.StartReceiver()
-						rtpPort = rtpSess.LocalPort()
+							rtpSess = newRTPSession(pc, &net.UDPAddr{IP: remoteRTPIP, Port: offer.Port}, audioPT, telPT, func(d string) {
+								parts := strings.SplitN(sessKey, "|", 2)
+								callID := ""
+								fromTag := ""
+								if len(parts) == 2 {
+									callID = parts[0]
+									fromTag = parts[1]
+								}
+								s.sessionMu.Lock()
+								sess := s.ivrSessions[sessKey]
+								if sess != nil {
+									s.handleIVRDigitLocked(sessKey, sess, d, callID, fromTag)
+								}
+								s.sessionMu.Unlock()
+							})
+							rtpSess.StartReceiver()
+							rtpPort = rtpSess.LocalPort()
+						}
 					}
 				}
 
 				if rtpPort == 0 {
 					rtpPort = localPort
 				}
-				sdp := buildIVRSDPAnswer(advertiseIP, rtpPort, offer.TelephoneEventPT)
+				var sdp string
 				if rtpSess != nil {
-					log.Printf("IVR RTP negotiated local_rtp_port=%d remote_rtp=%s telephone_event_pt=%d", rtpPort, rtpSess.remote.String(), offer.TelephoneEventPT)
+					sdp = buildBridgeFanoutSDPAnswer(advertiseIP, rtpPort, offer.TelephoneEventPT, audioPT)
 				} else {
-					log.Printf("IVR RTP not negotiated (no PCMU offer?) remote=%s offered_tel_pt=%d", remote.String(), offer.TelephoneEventPT)
+					sdp = buildMinimalSDP(advertiseIP, rtpPort)
+				}
+				if rtpSess != nil {
+					log.Printf("IVR RTP negotiated local_rtp_port=%d remote_rtp=%s audio_pt=%d telephone_event_pt=%d", rtpPort, rtpSess.remote.String(), audioPT, offer.TelephoneEventPT)
+				} else {
+					log.Printf("IVR RTP not negotiated (no PCMU/PCMA offer?) remote=%s offered_tel_pt=%d", remote.String(), offer.TelephoneEventPT)
 				}
 				log.Printf("IVR SDP answer:\n%s", sdp)
 				extra := map[string]string{
@@ -928,20 +1094,20 @@ func (s *Server) Start(ctx context.Context) error {
 				okResp, _ := BuildResponse(msg, 200, "OK", extra, []byte(sdp))
 				_, _ = conn.WriteToUDP(okResp, remote)
 
-				if rtpSess != nil {
+				if rtpSess != nil && rtpSess.pt == 0 {
 					go rtpSess.PlayTone(880, 1200*time.Millisecond, 0.25)
 				}
 
 				s.sessionMu.Lock()
 				s.ivrSessions[sessKey] = &ivrSession{
-					key: sessKey,
-					remote: remote,
+					key:        sessKey,
+					remote:     remote,
 					fromHeader: fromHdr,
-					toHeader: toWithTag,
+					toHeader:   toWithTag,
 					contactURI: contactURI,
-					createdAt: time.Now().UTC(),
-					state: ivrStateCollectBridge,
-					rtp: rtpSess,
+					createdAt:  time.Now().UTC(),
+					state:      ivrStateCollectBridge,
+					rtp:        rtpSess,
 					dtmfViaRTP: rtpSess != nil && offer.TelephoneEventPT > 0,
 				}
 				s.sessionMu.Unlock()
@@ -971,7 +1137,9 @@ func (s *Server) Start(ctx context.Context) error {
 						}
 					}
 				}
-				if callerSide == "A" {
+				if isHOOTGroup(target.Group) {
+					ring = buildHOOTRingEndpoints(fromUser, target.Group.SideA, target.Group.SideB)
+				} else if callerSide == "A" {
 					ring = append([]config.Endpoint(nil), target.Group.SideB...)
 				} else if callerSide == "B" {
 					ring = append([]config.Endpoint(nil), target.Group.SideA...)
@@ -1013,6 +1181,15 @@ func (s *Server) Start(ctx context.Context) error {
 						}
 						ardJoinDone = true
 					}
+				}
+			case InviteTargetKindHootGroup:
+				hoot := target.HootGroup
+				ring = buildHOOTRingEndpoints(fromUser, hoot.Talkers, hoot.Listeners)
+				if len(ring) > 0 {
+					log.Printf("SIP INVITE hootGroup ring order: group_id=%s", hoot.ID)
+				}
+				if hoot.RingTimeoutSeconds > 0 {
+					ringTimeout = time.Duration(hoot.RingTimeoutSeconds) * time.Second
 				}
 			case InviteTargetKindBridge:
 				bridge := target.Bridge
@@ -1092,18 +1269,26 @@ func (s *Server) Start(ctx context.Context) error {
 						m = make(map[string]*bridgeCall)
 						s.bridgeCalls[target.Bridge.ID] = m
 					}
-					m[sessKey] = &bridgeCall{
-						bridgeID: target.Bridge.ID,
-						callID: callID,
-						fromTag: fromTag,
-						toTag: toTag,
-						fromHeader: fromHdr,
-						toHeader: toWithTag,
-						contactURI: contactURI,
-						remote: remote,
-						createdAt: time.Now().UTC(),
+					lineLbl := ""
+					if s.router != nil {
+						cfg := s.router.CurrentConfig()
+						lineLbl = bridgeLineLabelForFrom(cfg, target.Bridge.ID, fromHdr)
 					}
+					bc := &bridgeCall{
+						bridgeID:   target.Bridge.ID,
+						callID:     callID,
+						fromTag:    fromTag,
+						toTag:      toTag,
+						fromHeader: fromHdr,
+						toHeader:   toWithTag,
+						contactURI: contactURI,
+						remote:     remote,
+						createdAt:  time.Now().UTC(),
+						lineLabel:  lineLbl,
+					}
+					m[sessKey] = bc
 					s.sessionMu.Unlock()
+					s.openBridgeCapture(bc, target.Bridge, fromHdr, callID)
 					s.tryStartSIPRECForBridge(target.Bridge.ID, sessKey)
 					break
 				}
@@ -1134,19 +1319,28 @@ func (s *Server) Start(ctx context.Context) error {
 				confGroupID = strings.TrimSpace(target.Group.ID)
 			}
 			sess := &fanoutSession{
-				key:                sessKey,
-				inboundInvite:      msg,
-				inboundRemote:      remote,
-				inboundBC:          sipBackchannel{UDP: conn, Peer: remote},
-				createdAt:          time.Now().UTC(),
-				targetKind:         target.Kind,
-				bridgeID:           bridgeID,
-				ConferenceGroupID:  confGroupID,
-				ConferenceARD:      target.Kind == InviteTargetKindConferenceGroup && isARDGroup(target.Group),
-				ringTimeout:        ringTimeout,
+				key:               sessKey,
+				inboundInvite:     msg,
+				inboundRemote:     remote,
+				inboundBC:         sipBackchannel{UDP: conn, Peer: remote},
+				createdAt:         time.Now().UTC(),
+				targetKind:        target.Kind,
+				bridgeID:          bridgeID,
+				ConferenceGroupID: confGroupID,
+				ConferenceARD:     target.Kind == InviteTargetKindConferenceGroup && isARDGroup(target.Group),
+				ringTimeout:       ringTimeout,
 			}
 			s.sessions[sessKey] = sess
 			s.sessionMu.Unlock()
+
+			// Fork SIPREC as soon as the inbound caller is admitted to a fanout session — do not wait for
+			// far-end 2xx/ACK (PA/speaker endpoints may carry media without classic answer semantics).
+			if target.Kind == InviteTargetKindConferenceGroup && strings.TrimSpace(confGroupID) != "" {
+				s.startSIPRECForConferenceFanoutEarly(sessKey, confGroupID, msg, remote, contactURI)
+			}
+			if target.Kind == InviteTargetKindBridge && strings.TrimSpace(bridgeID) != "" && len(ring) > 0 {
+				s.startSIPRECForBridgeFanoutEarly(sessKey, bridgeID, msg, remote, contactURI)
+			}
 
 			for _, ep := range ring {
 				if ep.SIPURI == "" {
@@ -1292,6 +1486,10 @@ func (s *Server) handleIVRDigitLocked(key string, sess *ivrSession, digit string
 						m = make(map[string]*bridgeCall)
 						s.bridgeCalls[targetID] = m
 					}
+					lineLbl := ""
+					if s.router != nil {
+						lineLbl = bridgeLineLabelForFrom(s.router.CurrentConfig(), targetID, sess.fromHeader)
+					}
 					m[key] = &bridgeCall{
 						bridgeID:        targetID,
 						callID:          callID,
@@ -1305,6 +1503,9 @@ func (s *Server) handleIVRDigitLocked(key string, sess *ivrSession, digit string
 						userID:          dialUserID,
 						userDisplayName: dialDisplay,
 						pinLen:          pinLen,
+						participantPIN:  pin,
+						lineLabel:       lineLbl,
+						rtp:             sess.rtp, // same socket as IVR — SIPREC forward + silence use this leg
 					}
 					sess.state = ivrStateJoined
 					if sess.rtp != nil {
@@ -1312,7 +1513,12 @@ func (s *Server) handleIVRDigitLocked(key string, sess *ivrSession, digit string
 					}
 					delete(s.ivrSessions, key)
 					log.Printf("IVR joined bridge key=%s bridge_id=%s", key, targetID)
-					s.tryStartSIPRECForBridge(targetID, key)
+					// Do not call tryStartSIPRECForBridge while sessionMu is held: emitSIPRECInvite
+					// also takes sessionMu and would deadlock the RTP/INFO digit path.
+					bid, bk := targetID, key
+					go func() {
+						s.tryStartSIPRECForBridge(bid, bk)
+					}()
 					return
 				}
 				if kind == InviteTargetKindConferenceGroup {
@@ -1351,7 +1557,16 @@ func (s *Server) handleIVRDigitLocked(key string, sess *ivrSession, digit string
 						sess.rtp.StartSilence()
 					}
 					log.Printf("IVR joined conferenceGroup key=%s group_id=%s type=%s caller_side=%s", key, targetID, gType, callerSide)
-					if gType == "ard" {
+					// Start SIPREC as soon as the caller is in the conference (same logical key as fanout winner path;
+					// emitSIPRECInvite dedupes so we do not fork twice). Do not call while sessionMu is held.
+					ik, ivr := key, sess
+					go func() {
+						s.tryStartSIPRECForIVRConference(ik, ivr)
+					}()
+					if gType == "mrd" {
+						log.Printf("IVR conferenceGroup MRD key=%s: press DTMF 9 to ring far side", key)
+					}
+					if gType == "ard" || gType == "hoot" {
 						go s.ivrStartConferenceGroupFanout(key, sess)
 					}
 					return
@@ -1462,8 +1677,14 @@ func (s *Server) handleResponse(msg *Message) {
 			}
 			localIP, localPort := s.localViaForLeg(leg)
 			ack := BuildOutboundAck(ackTarget, localIP, localPort, leg.callID, leg.fromTag, extractTag(leg.toHeader), leg.viaTransport)
+			logicalKey := strings.TrimPrefix(leg.sessionKey, "siprec|")
+			sdpBody := string(msg.Body)
+			// Must unlock before attachSIPRECMediaFromAnswer: it locks sessionMu for bridge/IVR lookup.
+			s.sessionMu.Unlock()
 			_ = s.writeLegOutbound(leg, ack)
+			s.attachSIPRECMediaFromAnswer(logicalKey, sdpBody)
 			log.Printf("SIPREC recording session established call_id=%s", leg.callID)
+			return
 		} else if respStatus >= 400 {
 			logicalKey := strings.TrimPrefix(leg.sessionKey, "siprec|")
 			delete(s.siprecRecordings, logicalKey)
@@ -1514,11 +1735,23 @@ func (s *Server) handleResponse(msg *Message) {
 					cancel := BuildOutboundCancel(l.targetURI, li, lp, l.callID, l.branch, l.fromTag, l.viaTransport)
 					_ = s.writeLegOutbound(l, cancel)
 				}
-				// Wire up RTP relay between IVR caller RTP and answered endpoint RTP.
+				// SIPREC toward the recorder does not require RTP relay; start on first 2xx so a parse/relay
+				// failure cannot block the SIPREC INVITE (same as IVR bridge join using go tryStartSIPRECForBridge).
 				ivrKey := fs.ivrKey
 				s.sessionMu.Lock()
 				ivrSess := s.ivrSessions[ivrKey]
 				s.sessionMu.Unlock()
+				if ivrSess != nil {
+					log.Printf("IVR conferenceGroup fanout winner call_id=%s target=%s", callID, winnerLeg.targetURI)
+					ik, is := ivrKey, ivrSess
+					go func() {
+						s.tryStartSIPRECForIVRConference(ik, is)
+					}()
+				} else {
+					log.Printf("IVR conferenceGroup fanout winner call_id=%s target=%s (ivr session gone; SIPREC skipped)", callID, winnerLeg.targetURI)
+				}
+
+				// Wire up RTP relay between IVR caller RTP and answered endpoint RTP (best-effort).
 				if ivrSess != nil && ivrSess.rtp != nil && winnerLeg.rtp != nil {
 					offer, okOffer := parseSDPAudioOffer(okSDP, nil)
 					if okOffer {
@@ -1529,20 +1762,25 @@ func (s *Server) handleResponse(msg *Message) {
 						ivrSess.rtp.StartReceiver()
 						winnerLeg.rtp.SetOnRTPPacket(func(pkt []byte) {
 							_, _ = ivrSess.rtp.conn.WriteToUDP(pkt, ivrSess.rtp.remote)
+							s.forwardSIPRECIVRLeg(ivrSess, 1, pkt)
 						})
 						ivrSess.rtp.SetOnRTPPacket(func(pkt []byte) {
 							_, _ = winnerLeg.rtp.conn.WriteToUDP(pkt, winnerLeg.rtp.remote)
+							s.forwardSIPRECIVRLeg(ivrSess, 0, pkt)
 						})
-						log.Printf("IVR conferenceGroup RTP relay established ivr_key=%s winner_call_id=%s rtp_remote=%s", ivrKey, winnerLeg.callID, winnerLeg.rtp.remote.String())
-						s.tryStartSIPRECForIVRConference(ivrKey, ivrSess)
+						// Local audio capture — chain after SIPREC callbacks.
+						s.openConferenceCapture(fs, ivrSess)
+						if fs.cap != nil {
+							ivrSess.rtp.AddOnRTPPacket(fs.cap.WriteInboundRTP)
+							winnerLeg.rtp.AddOnRTPPacket(fs.cap.WriteOutboundRTP)
+						}
+						log.Printf("IVR conferenceGroup RTP relay established ivr_key=%s winner_call_id=%s rtp_remote=%s capture=%v", ivrKey, winnerLeg.callID, winnerLeg.rtp.remote.String(), fs.cap != nil)
 					} else {
 						log.Printf("IVR conferenceGroup RTP relay skipped: cannot parse OK SDP winner_call_id=%s", winnerLeg.callID)
 					}
 				} else {
 					log.Printf("IVR conferenceGroup RTP relay not ready ivr_rtp=%v winner_rtp=%v", ivrSess != nil && ivrSess.rtp != nil, winnerLeg.rtp != nil)
 				}
-
-				log.Printf("IVR conferenceGroup fanout winner call_id=%s target=%s", callID, winnerLeg.targetURI)
 				return
 			}
 		}
@@ -1593,6 +1831,13 @@ func (s *Server) handleResponse(msg *Message) {
 		advertiseIPStr := s.advertisedIPForInbound(sess)
 		toWithTag, toTag := ensureToTagWithValue(inbound.Header("to"))
 		sdp := buildMinimalSDP(advertiseIPStr, localPort)
+		var inboundRtp, peerRtp *rtpSession
+		if status >= 200 && status < 300 && callID == winner {
+			if inR, peerR, ans, okMedia := s.setupFanoutBridgeRTP(sess, msg, advertiseIPStr); okMedia {
+				inboundRtp, peerRtp = inR, peerR
+				sdp = ans
+			}
+		}
 		contactTx := "udp"
 		if sess.inboundBC.Conn != nil {
 			contactTx = "tls"
@@ -1612,53 +1857,122 @@ func (s *Server) handleResponse(msg *Message) {
 			contactURI := ExtractURIFromAddressHeader(inbound.Header("contact"))
 			fromTag := extractTag(fromHdr)
 			sessKey := strings.TrimSpace(inbound.Header("call-id")) + "|" + fromTag
-			s.sessionMu.Lock()
+			// Already holding sessionMu (lock at start of handleResponse); do not nest Lock.
 			m := s.bridgeCalls[bridgeID]
 			if m == nil {
 				m = make(map[string]*bridgeCall)
 				s.bridgeCalls[bridgeID] = m
 			}
-			m[sessKey] = &bridgeCall{
-				bridgeID:    bridgeID,
-				callID:      strings.TrimSpace(inbound.Header("call-id")),
-				fromTag:     fromTag,
-				toTag:       toTag,
-				fromHeader:  fromHdr,
-				toHeader:    toWithTag,
-				contactURI:  contactURI,
-				remote:      remote,
-				createdAt:   time.Now().UTC(),
+			prev := m[sessKey]
+			pinCarry := ""
+			if prev != nil {
+				pinCarry = strings.TrimSpace(prev.participantPIN)
 			}
+			lineLbl := ""
+			if s.router != nil {
+				lineLbl = bridgeLineLabelForFrom(s.router.CurrentConfig(), bridgeID, fromHdr)
+			}
+			bc := &bridgeCall{
+				bridgeID:       bridgeID,
+				callID:         strings.TrimSpace(inbound.Header("call-id")),
+				fromTag:        fromTag,
+				toTag:          toTag,
+				fromHeader:     fromHdr,
+				toHeader:       toWithTag,
+				contactURI:     contactURI,
+				remote:         remote,
+				createdAt:      time.Now().UTC(),
+				participantPIN: pinCarry,
+				lineLabel:      lineLbl,
+				rtp:            inboundRtp,
+				peerRtp:        peerRtp,
+			}
+			if prev != nil {
+				mergeBridgeCallSIPRECState(bc, prev)
+			}
+			m[sessKey] = bc
 			s.sessionMu.Unlock()
+			if inboundRtp != nil {
+				s.wireBridgeRTPRelay(bc)
+			}
 			s.tryStartSIPRECForBridge(bridgeID, sessKey)
-		} else if strings.TrimSpace(sess.ConferenceGroupID) != "" && sess.ConferenceARD {
-			gid := strings.TrimSpace(sess.ConferenceGroupID)
-			ardBridgeID := syntheticARDBridgeID(gid)
-			fromHdr := inbound.Header("from")
-			contactURI := ExtractURIFromAddressHeader(inbound.Header("contact"))
-			fromTag := extractTag(fromHdr)
-			sessKey := strings.TrimSpace(inbound.Header("call-id")) + "|" + fromTag
-			s.sessionMu.Lock()
-			m := s.bridgeCalls[ardBridgeID]
-			if m == nil {
-				m = make(map[string]*bridgeCall)
-				s.bridgeCalls[ardBridgeID] = m
+			s.cancelLosers(inbound, winner)
+			s.cleanupSession(inbound)
+			_ = ringTimeout
+			return
+		}
+		if gid := strings.TrimSpace(sess.ConferenceGroupID); gid != "" {
+			// Conference group (MRD or ARD): fork SIPREC when group recording is enabled
+			// (omitted recording_enabled defaults on, same as bridges), or linked-user recording opt-in.
+			cfg := s.router.CurrentConfig()
+			g, ok := conferenceGroupByID(cfg, gid)
+			if !ok {
+				log.Printf("SIPREC skip conference group_id=%s: group not found in config", gid)
+			} else {
+				fromHdr := inbound.Header("from")
+				uid, disp := conferenceInviteParticipantLabels(cfg, g, fromHdr)
+				allowSIPREC := conferenceGroupRecordingEnabled(g)
+				if !allowSIPREC && uid != "" {
+					for i := range cfg.Spec.Users {
+						u := &cfg.Spec.Users[i]
+						if u.ID == uid && u.RecordingOptIn {
+							allowSIPREC = true
+							break
+						}
+					}
+				}
+				if !allowSIPREC {
+					log.Printf("SIPREC skip conference group_id=%s: group recording disabled and no participant recording opt-in (set recording_enabled: true, or omit key for default-on; or link From URI to a user with recording_opt_in)", gid)
+				} else {
+					ardBridgeID := syntheticARDBridgeID(gid)
+					contactURI := ExtractURIFromAddressHeader(inbound.Header("contact"))
+					fromTag := extractTag(fromHdr)
+					sessKey := strings.TrimSpace(inbound.Header("call-id")) + "|" + fromTag
+					m := s.bridgeCalls[ardBridgeID]
+					if m == nil {
+						m = make(map[string]*bridgeCall)
+						s.bridgeCalls[ardBridgeID] = m
+					}
+					prev := m[sessKey]
+					pinCarry := ""
+					if prev != nil {
+						pinCarry = strings.TrimSpace(prev.participantPIN)
+					}
+					bc := &bridgeCall{
+						bridgeID:        ardBridgeID,
+						callID:          strings.TrimSpace(inbound.Header("call-id")),
+						fromTag:         fromTag,
+						toTag:           toTag,
+						fromHeader:      fromHdr,
+						toHeader:        toWithTag,
+						contactURI:      contactURI,
+						remote:          remote,
+						createdAt:       time.Now().UTC(),
+						userID:          uid,
+						userDisplayName: disp,
+						participantPIN:  pinCarry,
+						lineLabel:       strings.TrimSpace(g.LineLabel),
+						rtp:             inboundRtp,
+						peerRtp:         peerRtp,
+					}
+					if prev != nil {
+						mergeBridgeCallSIPRECState(bc, prev)
+					}
+					m[sessKey] = bc
+					s.sessionMu.Unlock()
+					if inboundRtp != nil {
+						s.wireBridgeRTPRelay(bc)
+					}
+					s.tryStartSIPRECForBridge(ardBridgeID, sessKey)
+					s.cancelLosers(inbound, winner)
+					s.cleanupSession(inbound)
+					_ = ringTimeout
+					return
+				}
 			}
-			m[sessKey] = &bridgeCall{
-				bridgeID:   ardBridgeID,
-				callID:     strings.TrimSpace(inbound.Header("call-id")),
-				fromTag:    fromTag,
-				toTag:      toTag,
-				fromHeader: fromHdr,
-				toHeader:   toWithTag,
-				contactURI: contactURI,
-				remote:     remote,
-				createdAt:  time.Now().UTC(),
-			}
-			s.sessionMu.Unlock()
-			s.tryStartSIPRECForBridge(ardBridgeID, sessKey)
 		}
 
+		s.sessionMu.Unlock()
 		s.cancelLosers(inbound, winner)
 		s.cleanupSession(inbound)
 		_ = ringTimeout
@@ -1668,8 +1982,11 @@ func (s *Server) handleResponse(msg *Message) {
 	if allFinal {
 		fail, _ := BuildResponse(inbound, 480, "Temporarily Unavailable", nil, nil)
 		_ = sess.inboundBC.Write(fail)
+		s.sessionMu.Unlock()
 		s.cleanupSession(inbound)
+		return
 	}
+	s.sessionMu.Unlock()
 }
 
 func (s *Server) enforceRingTimeout(sessKey string, d time.Duration) {
@@ -1723,8 +2040,11 @@ func (s *Server) handleInboundCancel(msg *Message, conn *net.UDPConn, remote *ne
 		delete(s.ivrSessions, key)
 	}
 	s.sessionMu.Unlock()
-	if ivrSess != nil && ivrSess.rtp != nil {
-		ivrSess.rtp.Close()
+	if ivrSess != nil {
+		s.clearIVRSIPRECForwarding(ivrSess)
+		if ivrSess.rtp != nil {
+			ivrSess.rtp.Close()
+		}
 	}
 	s.stopSIPRECRecording("ivr:" + key)
 
@@ -1771,9 +2091,20 @@ func (s *Server) handleInboundBye(msg *Message, conn *net.UDPConn, remote *net.U
 	if ivrSess != nil {
 		delete(s.ivrSessions, key)
 	}
+	ivrFanKey := "ivrconf|" + key
+	ivrFS := s.ivrConfSessions[ivrFanKey]
+	if ivrFS != nil && !ivrFS.terminated {
+		ivrFS.terminated = true
+	}
 	s.sessionMu.Unlock()
-	if ivrSess != nil && ivrSess.rtp != nil {
-		ivrSess.rtp.Close()
+	if ivrFS != nil && ivrFS.cap != nil {
+		ivrFS.cap.Close()
+	}
+	if ivrSess != nil {
+		s.clearIVRSIPRECForwarding(ivrSess)
+		if ivrSess.rtp != nil {
+			ivrSess.rtp.Close()
+		}
 	}
 	s.stopSIPRECRecording("ivr:" + key)
 
@@ -1815,14 +2146,21 @@ func (s *Server) cleanupBridgeCallByKey(key string) {
 	s.sessionMu.Lock()
 	var bridgeID string
 	var found bool
+	var callCap *capture.CallCapture
 	for bid, m := range s.bridgeCalls {
 		if c, ok := m[key]; ok {
 			found = true
 			bridgeID = bid
+			callCap = c.cap
 			if c != nil && c.rtp != nil {
 				c.rtp.Close()
 				c.rtp = nil
 			}
+			if c != nil && c.peerRtp != nil {
+				c.peerRtp.Close()
+				c.peerRtp = nil
+			}
+			s.clearBridgeSIPRECForwarding(c)
 			delete(m, key)
 			if len(m) == 0 {
 				delete(s.bridgeCalls, bid)
@@ -1833,6 +2171,722 @@ func (s *Server) cleanupBridgeCallByKey(key string) {
 	s.sessionMu.Unlock()
 	if found {
 		s.stopSIPRECRecording("bridge:" + bridgeID + ":" + key)
+		callCap.Close()
+	}
+}
+
+func resolveCallerIdentity(cfg config.RootConfig, fromHdr string) (userID, displayName, deviceID, deviceKind string) {
+	fromURI := ExtractURIFromAddressHeader(fromHdr)
+	fromUser := ExtractUserFromURI(fromURI)
+	if fromUser == "" {
+		return "", "", "", ""
+	}
+	for _, u := range cfg.Spec.Users {
+		for _, d := range u.Devices {
+			addr := strings.TrimSpace(d.Address)
+			if addr == "" {
+				continue
+			}
+			du := ExtractUserFromURI(addr)
+			if strings.EqualFold(du, fromUser) {
+				return strings.TrimSpace(u.ID), strings.TrimSpace(u.DisplayName), strings.TrimSpace(d.ID), strings.TrimSpace(string(d.Kind))
+			}
+		}
+	}
+	for _, u := range cfg.Spec.Users {
+		if strings.EqualFold(strings.TrimSpace(u.ParticipantID), strings.TrimSpace(fromUser)) {
+			return strings.TrimSpace(u.ID), strings.TrimSpace(u.DisplayName), "", ""
+		}
+	}
+	return "", "", "", ""
+}
+
+// openConferenceCapture creates a local audio capture session for an IVR conference fanout and
+// stores it in fs.cap.  No-op if conference capture is disabled in captureSpec.
+func (s *Server) openConferenceCapture(fs *ivrConferenceFanoutSession, ivrSess *ivrSession) {
+	if s == nil || fs == nil || !s.captureSpec.ConferenceCaptureEnabled() {
+		return
+	}
+	dir := s.captureSpec.CaptureDirectory() + "/" + time.Now().UTC().Format("2006-01-02")
+	groupName := ""
+	if s.router != nil {
+		cfg := s.router.CurrentConfig()
+		if g, ok := conferenceGroupByID(cfg, fs.groupID); ok {
+			groupName = g.Name
+		}
+	}
+	fromHdr := ""
+	remoteAddr := ""
+	userID := ""
+	displayName := ""
+	deviceID := ""
+	deviceKind := ""
+	if ivrSess != nil {
+		fromHdr = ivrSess.fromHeader
+		if ivrSess.remote != nil {
+			remoteAddr = ivrSess.remote.String()
+		}
+		userID = ivrSess.participantID
+		displayName = ivrSess.participantID
+		if s.router != nil {
+			cfg := s.router.CurrentConfig()
+			uid, disp, did, dkind := resolveCallerIdentity(cfg, fromHdr)
+			if uid != "" {
+				userID = uid
+			}
+			if disp != "" {
+				displayName = disp
+			}
+			deviceID = did
+			deviceKind = dkind
+		}
+	}
+	meta := capture.CallMeta{
+		SessionKey:          fs.key,
+		CallType:            "conference",
+		ConferenceGroupID:   fs.groupID,
+		ConferenceGroupName: groupName,
+		Inbound: &capture.ParticipantMeta{
+			Role:        "inbound",
+			FromHeader:  fromHdr,
+			RemoteAddr:  remoteAddr,
+			UserID:      userID,
+			DeviceID:    deviceID,
+			DisplayName: displayName,
+			DeviceKind:  deviceKind,
+		},
+	}
+	cap, err := capture.New(dir, meta, capture.PayloadPCMU, capture.PayloadPCMU)
+	if err != nil {
+		log.Printf("capture: open conference capture err=%v group_id=%s", err, fs.groupID)
+		return
+	}
+	fs.cap = cap
+}
+
+// openBridgeCapture creates a local audio capture session for a bridge call and
+// stores it in bc.cap.  No-op if local capture is disabled in captureSpec.
+func (s *Server) openBridgeCapture(bc *bridgeCall, bridge config.Bridge, fromHdr, callID string) {
+	if s == nil || bc == nil || !s.captureSpec.BridgeCaptureEnabled() {
+		return
+	}
+	dir := s.captureSpec.CaptureDirectory() + "/" + time.Now().UTC().Format("2006-01-02")
+	cfg := config.RootConfig{}
+	if s.router != nil {
+		cfg = s.router.CurrentConfig()
+	}
+	userID := strings.TrimSpace(bc.userID)
+	displayName := strings.TrimSpace(bc.userDisplayName)
+	deviceID := ""
+	deviceKind := ""
+	if uid, disp, did, dkind := resolveCallerIdentity(cfg, fromHdr); uid != "" || disp != "" || did != "" || dkind != "" {
+		if uid != "" {
+			userID = uid
+		}
+		if disp != "" {
+			displayName = disp
+		}
+		deviceID = did
+		deviceKind = dkind
+	}
+	remoteAddr := ""
+	if bc.remote != nil {
+		remoteAddr = bc.remote.String()
+	}
+	fromURI := ExtractURIFromAddressHeader(fromHdr)
+	meta := capture.CallMeta{
+		SessionKey: bc.callID,
+		SIPCallID:  callID,
+		CallType:   "bridge",
+		BridgeID:   bridge.ID,
+		BridgeName: bridge.Name,
+		LineLabel:  bridge.LineLabel,
+		Inbound: &capture.ParticipantMeta{
+			Role:        "inbound",
+			FromURI:     fromURI,
+			FromHeader:  fromHdr,
+			RemoteAddr:  remoteAddr,
+			UserID:      userID,
+			DeviceID:    deviceID,
+			DisplayName: displayName,
+			DeviceKind:  deviceKind,
+			LineLabel:   bc.lineLabel,
+		},
+	}
+	cap, err := capture.New(dir, meta, capture.PayloadPCMU, capture.PayloadPCMU)
+	if err != nil {
+		log.Printf("capture: open bridge capture err=%v bridge_id=%s", err, bridge.ID)
+		return
+	}
+	bc.cap = cap
+}
+
+func (s *Server) findIPTVSourceByID(sourceID string) (*config.IPTVSourceSpec, bool) {
+	if s == nil || s.router == nil {
+		return nil, false
+	}
+	id := strings.TrimSpace(sourceID)
+	if id == "" {
+		return nil, false
+	}
+	cfg := s.router.CurrentConfig()
+	for i := range cfg.Spec.IPTVSources {
+		if strings.TrimSpace(cfg.Spec.IPTVSources[i].ID) == id {
+			return &cfg.Spec.IPTVSources[i], true
+		}
+	}
+	return nil, false
+}
+
+func (s *Server) forwardIPTVToBridges(sourceID string, pkt []byte) {
+	if s == nil || s.router == nil || len(pkt) < 12 {
+		return
+	}
+	cfg := s.router.CurrentConfig()
+	groupIDs := make(map[string]struct{})
+	for _, g := range cfg.Spec.ConferenceGroups {
+		for _, sid := range g.IPTVSourceIDs {
+			if strings.EqualFold(strings.TrimSpace(sid), strings.TrimSpace(sourceID)) {
+				groupIDs[strings.TrimSpace(g.ID)] = struct{}{}
+				break
+			}
+		}
+	}
+	if len(groupIDs) == 0 {
+		return
+	}
+	s.sessionMu.Lock()
+	defer s.sessionMu.Unlock()
+	for bridgeID, calls := range s.bridgeCalls {
+		if !strings.HasPrefix(bridgeID, ardGroupBridgePrefix) {
+			continue
+		}
+		groupID := strings.TrimPrefix(bridgeID, ardGroupBridgePrefix)
+		if _, ok := groupIDs[groupID]; !ok {
+			continue
+		}
+		for _, bc := range calls {
+			if bc == nil {
+				continue
+			}
+			if bc.rtp != nil {
+				bc.rtp.mu.Lock()
+				dst := bc.rtp.remote
+				conn := bc.rtp.conn
+				bc.rtp.mu.Unlock()
+				if dst != nil && conn != nil {
+					_, _ = conn.WriteToUDP(pkt, dst)
+				}
+			}
+			if bc.peerRtp != nil {
+				bc.peerRtp.mu.Lock()
+				dst := bc.peerRtp.remote
+				conn := bc.peerRtp.conn
+				bc.peerRtp.mu.Unlock()
+				if dst != nil && conn != nil {
+					_, _ = conn.WriteToUDP(pkt, dst)
+				}
+			}
+		}
+	}
+}
+
+func (s *Server) StartIPTVSubscription(sourceID string) error {
+	src, ok := s.findIPTVSourceByID(sourceID)
+	if !ok || src == nil {
+		return fmt.Errorf("iptv source not found: %s", sourceID)
+	}
+	if !src.Enabled {
+		return fmt.Errorf("iptv source disabled: %s", sourceID)
+	}
+	id := strings.TrimSpace(src.ID)
+	s.sessionMu.Lock()
+	if _, exists := s.iptvSubs[id]; exists {
+		s.sessionMu.Unlock()
+		return nil
+	}
+	s.sessionMu.Unlock()
+
+	metrics := &IPTVSubscriptionMetrics{
+		SourceID:  id,
+		Running:   true,
+		StartedAt: time.Now().UTC(),
+	}
+	onPacket := func(pkt []byte) {
+		pt := int(pkt[1] & 0x7F)
+		want := src.PayloadType
+		if want <= 0 {
+			want = 0
+		}
+		if !src.ExtractAudioFromVideo && pt != want {
+			s.sessionMu.Lock()
+			metrics.DroppedPackets++
+			s.sessionMu.Unlock()
+			return
+		}
+		s.sessionMu.Lock()
+		metrics.AudioPackets++
+		metrics.LastAudioAt = time.Now().UTC()
+		s.sessionMu.Unlock()
+		s.forwardIPTVToBridges(id, pkt)
+	}
+
+	var sub *iptvSubscription
+	if src.ExtractAudioFromVideo {
+		ex, err := iptv.StartFFmpegAudioExtract(src.MulticastIP, src.Port, src.JitterBufferMs, onPacket, "iptv-extract source_id="+id)
+		if err != nil {
+			return err
+		}
+		sub = &iptvSubscription{SourceID: id, CloseFn: ex.Close, Metrics: metrics}
+	} else {
+		st, err := iptv.StartMulticast(src.MulticastIP, src.Port, onPacket, "iptv source_id="+id)
+		if err != nil {
+			return err
+		}
+		sub = &iptvSubscription{SourceID: id, CloseFn: st.Close, Metrics: metrics}
+	}
+	s.sessionMu.Lock()
+	s.iptvSubs[id] = sub
+	s.sessionMu.Unlock()
+	return nil
+}
+
+func (s *Server) StopIPTVSubscription(sourceID string) {
+	if s == nil {
+		return
+	}
+	id := strings.TrimSpace(sourceID)
+	s.sessionMu.Lock()
+	sub := s.iptvSubs[id]
+	delete(s.iptvSubs, id)
+	if sub != nil && sub.Metrics != nil {
+		sub.Metrics.Running = false
+	}
+	s.sessionMu.Unlock()
+	if sub != nil && sub.CloseFn != nil {
+		sub.CloseFn()
+	}
+}
+
+type IPTVSubscriptionStatus struct {
+	SourceID       string `json:"source_id"`
+	Running        bool   `json:"running"`
+	AudioPackets   uint64 `json:"audio_packets"`
+	DroppedPackets uint64 `json:"dropped_packets"`
+	LastAudioAt    string `json:"last_audio_at,omitempty"`
+	StartedAt      string `json:"started_at,omitempty"`
+	FFmpegPath     string `json:"ffmpeg_path,omitempty"`
+	FFmpegError    string `json:"ffmpeg_error,omitempty"`
+	FFmpegFound    bool   `json:"ffmpeg_found,omitempty"`
+}
+
+func (s *Server) ListIPTVSubscriptions() []IPTVSubscriptionStatus {
+	if s == nil || s.router == nil {
+		return nil
+	}
+	cfg := s.router.CurrentConfig()
+	s.sessionMu.Lock()
+	defer s.sessionMu.Unlock()
+	out := make([]IPTVSubscriptionStatus, 0, len(cfg.Spec.IPTVSources))
+	for _, src := range cfg.Spec.IPTVSources {
+		id := strings.TrimSpace(src.ID)
+		sub, running := s.iptvSubs[id]
+		row := IPTVSubscriptionStatus{SourceID: id, Running: running}
+		if src.ExtractAudioFromVideo {
+			diag := iptv.FFmpegBinaryDiagnostic()
+			row.FFmpegPath = diag.Path
+			row.FFmpegError = diag.Error
+			row.FFmpegFound = diag.Found
+		}
+		if sub != nil && sub.Metrics != nil {
+			row.AudioPackets = sub.Metrics.AudioPackets
+			row.DroppedPackets = sub.Metrics.DroppedPackets
+			if !sub.Metrics.LastAudioAt.IsZero() {
+				row.LastAudioAt = sub.Metrics.LastAudioAt.Format(time.RFC3339)
+			}
+			if !sub.Metrics.StartedAt.IsZero() {
+				row.StartedAt = sub.Metrics.StartedAt.Format(time.RFC3339)
+			}
+		}
+		out = append(out, row)
+	}
+	return out
+}
+
+// mergeBridgeCallSIPRECState moves SIPREC forward state from an early placeholder bridgeCall (fanout start)
+// onto the call established when the far end answers, so recorder destinations are not lost.
+func mergeBridgeCallSIPRECState(bc, prev *bridgeCall) {
+	if bc == nil || prev == nil {
+		return
+	}
+	prev.siprecFwdMu.Lock()
+	bc.siprecFwdMu.Lock()
+	if prev.siprecSilenceStop != nil {
+		close(prev.siprecSilenceStop)
+		prev.siprecSilenceStop = nil
+	}
+	bc.siprecFwdConn = prev.siprecFwdConn
+	bc.siprecFwdDst0 = prev.siprecFwdDst0
+	bc.siprecFwdDst1 = prev.siprecFwdDst1
+	prev.siprecFwdConn = nil
+	prev.siprecFwdDst0, prev.siprecFwdDst1 = nil, nil
+	bc.siprecFwdMu.Unlock()
+	prev.siprecFwdMu.Unlock()
+}
+
+// setupFanoutBridgeRTP negotiates RTP for the inbound caller (required) and the winning outbound leg when possible (PCMU).
+// Returns inbound-only media if the far-end SDP is missing PCMU or the peer socket cannot be opened — recording can still use one leg.
+func (s *Server) setupFanoutBridgeRTP(sess *fanoutSession, winnerMsg *Message, advertiseIP string) (inbound, peer *rtpSession, answerSDP string, ok bool) {
+	if sess == nil || winnerMsg == nil || sess.inboundInvite == nil {
+		return nil, nil, "", false
+	}
+	fallbackIP := net.IP(nil)
+	if sess.inboundRemote != nil {
+		fallbackIP = sess.inboundRemote.IP
+	}
+	offerIn, okIn := parseSDPAudioOffer(string(sess.inboundInvite.Body), fallbackIP)
+	if !okIn || (!offerIn.HasPCMU && !offerIn.HasPCMA) {
+		return nil, nil, "", false
+	}
+	inAudioPT := uint8(0)
+	if offerIn.HasPCMU {
+		inAudioPT = 0
+	} else {
+		inAudioPT = 8
+	}
+
+	offerWin, okWin := parseSDPAudioOffer(string(winnerMsg.Body), nil)
+	winOk := okWin && (offerWin.HasPCMU || offerWin.HasPCMA)
+	var peerAudioPT uint8
+	if winOk {
+		if offerWin.HasPCMU {
+			peerAudioPT = 0
+		} else {
+			peerAudioPT = 8
+		}
+	}
+
+	telIn := uint8(0)
+	if offerIn.TelephoneEventPT > 0 && offerIn.TelephoneEventPT < 128 {
+		telIn = uint8(offerIn.TelephoneEventPT)
+	}
+	telWin := uint8(0)
+	if winOk && offerWin.TelephoneEventPT > 0 && offerWin.TelephoneEventPT < 128 {
+		telWin = uint8(offerWin.TelephoneEventPT)
+	}
+
+	pcIn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	if err != nil {
+		return nil, nil, "", false
+	}
+	remoteIn := &net.UDPAddr{IP: offerIn.Addr, Port: offerIn.Port}
+	inbound = newRTPSession(pcIn, remoteIn, inAudioPT, telIn, nil)
+	inbound.StartReceiver()
+
+	if winOk {
+		pcPeer, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+		if err != nil {
+			log.Printf("bridge fanout: far-end RTP socket failed; inbound-only err=%v", err)
+		} else {
+			remotePeer := &net.UDPAddr{IP: offerWin.Addr, Port: offerWin.Port}
+			peer = newRTPSession(pcPeer, remotePeer, peerAudioPT, telWin, nil)
+			peer.StartReceiver()
+		}
+	} else {
+		log.Printf("bridge fanout: far-end SDP missing G.711 audio; inbound leg only for recording")
+	}
+
+	telAns := int(offerIn.TelephoneEventPT)
+	if telAns == 0 && winOk && offerWin.TelephoneEventPT > 0 {
+		telAns = offerWin.TelephoneEventPT
+	}
+	rtpPort := inbound.LocalPort()
+	answerSDP = buildBridgeFanoutSDPAnswer(advertiseIP, rtpPort, telAns, inAudioPT)
+	return inbound, peer, answerSDP, true
+}
+
+// wireBridgeSIPRECFromInboundOnly forwards caller RTP to SIPREC leg 0 and sends silence to leg 1 (no far-end peer yet).
+func (s *Server) wireBridgeSIPRECFromInboundOnly(bc *bridgeCall) {
+	if bc == nil || bc.rtp == nil {
+		return
+	}
+	bc.rtp.SetOnRTPPacket(func(pkt []byte) {
+		s.forwardSIPRECBridgeLeg(bc, 0, pkt)
+	})
+	s.startBridgeSIPRECSecondLegSilence(bc)
+	log.Printf("bridge single-leg SIPREC forward (caller RTP -> leg0, silence -> leg1) bridge_id=%s call_id=%s", bc.bridgeID, bc.callID)
+}
+
+func (s *Server) wireBridgeRTPRelay(bc *bridgeCall) {
+	if bc == nil || bc.rtp == nil {
+		return
+	}
+	in := bc.rtp
+	if bc.peerRtp != nil {
+		peer := bc.peerRtp
+		in.SetOnRTPPacket(func(pkt []byte) {
+			peer.mu.Lock()
+			dst := peer.remote
+			peer.mu.Unlock()
+			if dst != nil && peer.conn != nil {
+				_, _ = peer.conn.WriteToUDP(pkt, dst)
+			}
+			s.forwardSIPRECBridgeLeg(bc, 0, pkt)
+		})
+		peer.SetOnRTPPacket(func(pkt []byte) {
+			in.mu.Lock()
+			dst := in.remote
+			in.mu.Unlock()
+			if dst != nil && in.conn != nil {
+				_, _ = in.conn.WriteToUDP(pkt, dst)
+			}
+			s.forwardSIPRECBridgeLeg(bc, 1, pkt)
+		})
+		// Local audio capture — chain onto existing SIPREC callbacks.
+		if bc.cap != nil {
+			in.AddOnRTPPacket(bc.cap.WriteInboundRTP)
+			peer.AddOnRTPPacket(bc.cap.WriteOutboundRTP)
+		}
+		log.Printf("bridge fanout RTP relay established bridge_id=%s call_id=%s capture=%v", bc.bridgeID, bc.callID, bc.cap != nil)
+		return
+	}
+	s.wireBridgeSIPRECFromInboundOnly(bc)
+}
+
+// startBridgeSIPRECSecondLegSilence sends PCMU silence to the recorder's second leg when only the inbound RTP path exists.
+func (s *Server) startBridgeSIPRECSecondLegSilence(bc *bridgeCall) {
+	if bc == nil {
+		return
+	}
+	bc.siprecFwdMu.Lock()
+	if bc.siprecSilenceStop != nil {
+		bc.siprecFwdMu.Unlock()
+		return
+	}
+	bc.siprecSilenceStop = make(chan struct{})
+	stop := bc.siprecSilenceStop
+	bc.siprecFwdMu.Unlock()
+
+	go func() {
+		ptByte := uint8(0)
+		if bc.rtp != nil {
+			bc.rtp.mu.Lock()
+			ptByte = bc.rtp.pt & 0x7f
+			bc.rtp.mu.Unlock()
+		}
+		sil := make([]byte, 160)
+		fill := byte(0xff) // µ-law silence
+		if ptByte == 8 {
+			fill = 0xd5 // A-law silence
+		}
+		for i := range sil {
+			sil[i] = fill
+		}
+		var seq uint16 = uint16(rand.Uint32())
+		var ts uint32 = rand.Uint32()
+		ssrc := rand.Uint32()
+		tick := time.NewTicker(20 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-tick.C:
+				bc.siprecFwdMu.Lock()
+				dst := bc.siprecFwdDst1
+				conn := bc.siprecFwdConn
+				if conn == nil && dst != nil {
+					c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+					if err == nil {
+						bc.siprecFwdConn = c
+						conn = c
+					}
+				}
+				bc.siprecFwdMu.Unlock()
+				if conn == nil || dst == nil {
+					continue
+				}
+				hdr := make([]byte, 12)
+				hdr[0] = 0x80
+				hdr[1] = ptByte
+				binary.BigEndian.PutUint16(hdr[2:4], seq)
+				binary.BigEndian.PutUint32(hdr[4:8], ts)
+				binary.BigEndian.PutUint32(hdr[8:12], ssrc)
+				pkt := append(hdr, sil...)
+				_, _ = conn.WriteToUDP(pkt, dst)
+				seq++
+				ts += 160
+			}
+		}
+	}()
+}
+
+func (s *Server) forwardSIPRECBridgeLeg(bc *bridgeCall, legIndex int, pkt []byte) {
+	if bc == nil || len(pkt) < 12 {
+		return
+	}
+	bc.siprecFwdMu.Lock()
+	dst := bc.siprecFwdDst0
+	if legIndex == 1 {
+		dst = bc.siprecFwdDst1
+	}
+	conn := bc.siprecFwdConn
+	if conn == nil && dst != nil {
+		c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+		if err == nil {
+			bc.siprecFwdConn = c
+			conn = c
+		}
+	}
+	bc.siprecFwdMu.Unlock()
+	if conn == nil || dst == nil {
+		return
+	}
+	_, _ = conn.WriteToUDP(pkt, dst)
+}
+
+func (s *Server) clearBridgeSIPRECForwarding(bc *bridgeCall) {
+	if bc == nil {
+		return
+	}
+	bc.siprecFwdMu.Lock()
+	if bc.siprecSilenceStop != nil {
+		close(bc.siprecSilenceStop)
+		bc.siprecSilenceStop = nil
+	}
+	if bc.siprecFwdConn != nil {
+		_ = bc.siprecFwdConn.Close()
+		bc.siprecFwdConn = nil
+	}
+	bc.siprecFwdDst0, bc.siprecFwdDst1 = nil, nil
+	bc.siprecFwdMu.Unlock()
+}
+
+func (s *Server) clearIVRSIPRECForwarding(iv *ivrSession) {
+	if iv == nil {
+		return
+	}
+	iv.siprecFwdMu.Lock()
+	if iv.siprecFwdConn != nil {
+		_ = iv.siprecFwdConn.Close()
+		iv.siprecFwdConn = nil
+	}
+	iv.siprecFwdDst0, iv.siprecFwdDst1 = nil, nil
+	iv.siprecFwdMu.Unlock()
+}
+
+// clearSIPRECMediaForwardingByKey stops forwarding to the recorder when the SIPREC dialog ends.
+func (s *Server) clearSIPRECMediaForwardingByKey(logicalKey string) {
+	switch {
+	case strings.HasPrefix(logicalKey, "bridge:"):
+		rest := strings.TrimPrefix(logicalKey, "bridge:")
+		parts := strings.SplitN(rest, ":", 2)
+		if len(parts) != 2 {
+			return
+		}
+		bridgeID, sessKey := parts[0], parts[1]
+		s.sessionMu.Lock()
+		var bc *bridgeCall
+		if m := s.bridgeCalls[bridgeID]; m != nil {
+			bc = m[sessKey]
+		}
+		s.sessionMu.Unlock()
+		s.clearBridgeSIPRECForwarding(bc)
+	case strings.HasPrefix(logicalKey, "ivr:"):
+		ivrKey := strings.TrimPrefix(logicalKey, "ivr:")
+		s.sessionMu.Lock()
+		iv := s.ivrSessions[ivrKey]
+		s.sessionMu.Unlock()
+		s.clearIVRSIPRECForwarding(iv)
+	}
+}
+
+func (s *Server) forwardSIPRECIVRLeg(iv *ivrSession, legIndex int, pkt []byte) {
+	if iv == nil || len(pkt) < 12 {
+		return
+	}
+	iv.siprecFwdMu.Lock()
+	dst := iv.siprecFwdDst0
+	if legIndex == 1 {
+		dst = iv.siprecFwdDst1
+	}
+	conn := iv.siprecFwdConn
+	if conn == nil && dst != nil {
+		c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+		if err == nil {
+			iv.siprecFwdConn = c
+			conn = c
+		}
+	}
+	iv.siprecFwdMu.Unlock()
+	if conn == nil || dst == nil {
+		return
+	}
+	_, _ = conn.WriteToUDP(pkt, dst)
+}
+
+// attachSIPRECMediaFromAnswer parses the recorder 200 OK SDP and forwards RTP from bridge/IVR legs to rtpengine.
+// Do not call while holding sessionMu (this function locks it for bridge/IVR lookups).
+func (s *Server) attachSIPRECMediaFromAnswer(logicalKey, answerSDP string) {
+	dests, ok := parseMultipleAudioRTPDestinations(answerSDP)
+	if !ok || len(dests) < 2 {
+		log.Printf("SIPREC media: need at least two m=audio in answer logical=%s", logicalKey)
+		return
+	}
+	d0, d1 := dests[0], dests[1]
+
+	switch {
+	case strings.HasPrefix(logicalKey, "bridge:"):
+		rest := strings.TrimPrefix(logicalKey, "bridge:")
+		parts := strings.SplitN(rest, ":", 2)
+		if len(parts) != 2 {
+			log.Printf("SIPREC media: bad bridge logical key %q", logicalKey)
+			return
+		}
+		bridgeID, sessKey := parts[0], parts[1]
+		s.sessionMu.Lock()
+		var bc *bridgeCall
+		if m := s.bridgeCalls[bridgeID]; m != nil {
+			bc = m[sessKey]
+		}
+		s.sessionMu.Unlock()
+		if bc == nil {
+			log.Printf("SIPREC media: no bridge call logical=%s", logicalKey)
+			return
+		}
+		bc.siprecFwdMu.Lock()
+		bc.siprecFwdDst0, bc.siprecFwdDst1 = d0, d1
+		bc.siprecFwdMu.Unlock()
+		if bc.rtp == nil {
+			log.Printf("SIPREC media: recorder destinations saved (inbound RTP not up yet) logical=%s dst0=%s dst1=%s", logicalKey, d0.String(), d1.String())
+		} else {
+			log.Printf("SIPREC media attached logical=%s dst0=%s dst1=%s", logicalKey, d0.String(), d1.String())
+			// IVR dial-in: bridgeCall gets rtp only from sess.rtp; fanout may have wired callbacks already.
+			if bc.peerRtp == nil {
+				s.wireBridgeSIPRECFromInboundOnly(bc)
+			}
+		}
+
+	case strings.HasPrefix(logicalKey, "ivr:"):
+		ivrKey := strings.TrimPrefix(logicalKey, "ivr:")
+		s.sessionMu.Lock()
+		iv := s.ivrSessions[ivrKey]
+		s.sessionMu.Unlock()
+		if iv == nil {
+			log.Printf("SIPREC media: no IVR session logical=%s", logicalKey)
+			return
+		}
+		iv.siprecFwdMu.Lock()
+		iv.siprecFwdDst0, iv.siprecFwdDst1 = d0, d1
+		iv.siprecFwdMu.Unlock()
+		if iv.rtp == nil {
+			log.Printf("SIPREC media: recorder destinations saved (IVR RTP not up yet) logical=%s dst0=%s dst1=%s", logicalKey, d0.String(), d1.String())
+		} else {
+			log.Printf("SIPREC media attached (ivr) logical=%s dst0=%s dst1=%s", logicalKey, d0.String(), d1.String())
+		}
+
+	default:
+		log.Printf("SIPREC media: unknown logical key prefix %q", logicalKey)
 	}
 }
 
@@ -1881,7 +2935,8 @@ func (s *Server) tryHandleBridgeReinvite(msg *Message, conn *net.UDPConn, remote
 	}
 	offer, okOffer := parseSDPAudioOffer(body, remote.IP)
 	var sdp string
-	if okOffer && offer.HasPCMU {
+	audioPT, okAudio := pickIVRAudioPayloadType(offer)
+	if okOffer && okAudio {
 		if bc.rtp == nil {
 			pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
 			if err != nil {
@@ -1898,7 +2953,7 @@ func (s *Server) tryHandleBridgeReinvite(msg *Message, conn *net.UDPConn, remote
 			if remote != nil && remote.IP != nil && !remote.IP.IsUnspecified() {
 				remoteRTPIP = remote.IP
 			}
-			rtpSess := newRTPSession(pc, &net.UDPAddr{IP: remoteRTPIP, Port: offer.Port}, 0, telPT, nil)
+			rtpSess := newRTPSession(pc, &net.UDPAddr{IP: remoteRTPIP, Port: offer.Port}, audioPT, telPT, nil)
 			rtpSess.StartReceiver()
 			bc.rtp = rtpSess
 		} else {
@@ -1911,7 +2966,7 @@ func (s *Server) tryHandleBridgeReinvite(msg *Message, conn *net.UDPConn, remote
 			bc.rtp.mu.Unlock()
 		}
 		rtpPort := bc.rtp.LocalPort()
-		sdp = buildIVRSDPAnswer(advertiseIP, rtpPort, offer.TelephoneEventPT)
+		sdp = buildBridgeFanoutSDPAnswer(advertiseIP, rtpPort, offer.TelephoneEventPT, bc.rtp.pt)
 	} else {
 		if bc.rtp != nil {
 			bc.rtp.Close()
@@ -1971,7 +3026,8 @@ func (s *Server) tryHandleIVRReinvite(msg *Message, conn *net.UDPConn, remote *n
 	}
 	offer, okOffer := parseSDPAudioOffer(body, remote.IP)
 	var sdp string
-	if okOffer && offer.HasPCMU {
+	audioPT, okAudio := pickIVRAudioPayloadType(offer)
+	if okOffer && okAudio {
 		if sess.rtp == nil {
 			pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
 			if err != nil {
@@ -1988,7 +3044,7 @@ func (s *Server) tryHandleIVRReinvite(msg *Message, conn *net.UDPConn, remote *n
 			if remote != nil && remote.IP != nil && !remote.IP.IsUnspecified() {
 				remoteRTPIP = remote.IP
 			}
-			rtpSess := newRTPSession(pc, &net.UDPAddr{IP: remoteRTPIP, Port: offer.Port}, 0, telPT, func(d string) {
+			rtpSess := newRTPSession(pc, &net.UDPAddr{IP: remoteRTPIP, Port: offer.Port}, audioPT, telPT, func(d string) {
 				parts := strings.SplitN(sessKey, "|", 2)
 				callID := ""
 				fromTag := ""
@@ -2019,7 +3075,7 @@ func (s *Server) tryHandleIVRReinvite(msg *Message, conn *net.UDPConn, remote *n
 		if sess.rtp != nil {
 			rtpPort = sess.rtp.LocalPort()
 		}
-		sdp = buildIVRSDPAnswer(advertiseIP, rtpPort, offer.TelephoneEventPT)
+		sdp = buildBridgeFanoutSDPAnswer(advertiseIP, rtpPort, offer.TelephoneEventPT, sess.rtp.pt)
 	} else {
 		rtpPort := localPort
 		if sess.rtp != nil {
@@ -2235,12 +3291,26 @@ func buildInboundDialogBye(targetURI, localIP string, localPort int, callID, fro
 	return []byte(b.String())
 }
 
+// isLikelyDockerBridgeIPv4 matches common Docker bridge networks (docker0 172.17/16, first compose net 172.18/16).
+// SDP must not advertise these to LAN phones — they are not routable from outside the host.
+func isLikelyDockerBridgeIPv4(ip net.IP) bool {
+	v4 := ip.To4()
+	if v4 == nil {
+		return false
+	}
+	if v4[0] != 172 {
+		return false
+	}
+	return v4[1] == 17 || v4[1] == 18
+}
+
 func advertisedIP(conn *net.UDPConn, remote *net.UDPAddr) string {
-	// Prefer the bound local address if it's a concrete, non-unspecified IP.
+	// Prefer the bound local address if it's a concrete, non-unspecified IP — unless it is a Docker
+	// bridge IP (common when SIPBridge runs in a container: LAN cannot route to 172.17/172.18.x).
 	if conn != nil {
 		if la, ok := conn.LocalAddr().(*net.UDPAddr); ok && la != nil {
 			ip := la.IP
-			if ip != nil && !ip.IsUnspecified() {
+			if ip != nil && !ip.IsUnspecified() && !isLikelyDockerBridgeIPv4(ip) {
 				return ip.String()
 			}
 		}
@@ -2275,6 +3345,7 @@ func advertisedIP(conn *net.UDPConn, remote *net.UDPAddr) string {
 	}
 
 	var fallbackIPv4 string
+	var c192, c10, c172other []string
 	if addrs, err := net.InterfaceAddrs(); err == nil {
 		for _, a := range addrs {
 			ipnet, ok := a.(*net.IPNet)
@@ -2292,13 +3363,33 @@ func advertisedIP(conn *net.UDPConn, remote *net.UDPAddr) string {
 			if isLinkLocal(v4) {
 				continue
 			}
-			if isRFC1918(v4) {
-				return v4.String()
+			if isLikelyDockerBridgeIPv4(v4) {
+				continue
 			}
-			if fallbackIPv4 == "" {
-				fallbackIPv4 = v4.String()
+			if !isRFC1918(v4) {
+				if fallbackIPv4 == "" {
+					fallbackIPv4 = v4.String()
+				}
+				continue
+			}
+			s := v4.String()
+			if v4[0] == 192 && v4[1] == 168 {
+				c192 = append(c192, s)
+			} else if v4[0] == 10 {
+				c10 = append(c10, s)
+			} else if v4[0] == 172 {
+				c172other = append(c172other, s)
 			}
 		}
+	}
+	if len(c192) > 0 {
+		return c192[0]
+	}
+	if len(c10) > 0 {
+		return c10[0]
+	}
+	if len(c172other) > 0 {
+		return c172other[0]
 	}
 	if fallbackIPv4 != "" {
 		return fallbackIPv4
@@ -2331,12 +3422,78 @@ func buildMinimalSDP(ip string, port int) string {
 	return b.String()
 }
 
+// siprecInviteRTPBase returns the first m=audio RTP port for SIPREC SDP.
+// Never use the SIP UDP listener port (often 5060): rtpengine then shows peers at 5060/5062 and receives 0 RTP (empty PCAPs).
+// Override with SIPBRIDGE_SIPREC_RTP_BASE (even port in 1024–65400).
+func siprecInviteRTPBase() int {
+	if v := strings.TrimSpace(os.Getenv("SIPBRIDGE_SIPREC_RTP_BASE")); v != "" {
+		p, err := strconv.Atoi(v)
+		if err == nil && p >= 1024 && p <= 65400 {
+			if p%2 != 0 {
+				p++
+			}
+			return p
+		}
+	}
+	// Random even port in [20000, 59998] — typical RTP range, avoids 5060–5065.
+	p := 20000 + rand.Intn(40000)
+	if p%2 != 0 {
+		p++
+	}
+	return p
+}
+
+// buildSiprecInviteSDP returns SDP for outbound SIPREC INVITE multipart bodies.
+// SIPREC Node (lib/payload-parser.js) splits on exactly two m=audio sections; a single m= line fails parsing
+// and the recorder never sends 200 OK, so no media/recording is established.
+// rtpBase must be an RTP port (not the SIP signaling port).
+func buildSiprecInviteSDP(ip string, rtpBase int) string {
+	family := "IP4"
+	if parsed := net.ParseIP(strings.TrimSpace(ip)); parsed != nil {
+		if parsed.To4() == nil {
+			family = "IP6"
+		}
+	}
+	p1 := rtpBase
+	p2 := rtpBase + 2
+	if p2 > 65534 {
+		p2 = rtpBase - 2
+	}
+	var b strings.Builder
+	b.WriteString("v=0\r\n")
+	fmt.Fprintf(&b, "o=sipbridge 0 0 IN %s %s\r\n", family, ip)
+	b.WriteString("s=SIPBridge SIPREC\r\n")
+	fmt.Fprintf(&b, "c=IN %s %s\r\n", family, ip)
+	b.WriteString("t=0 0\r\n")
+	fmt.Fprintf(&b, "m=audio %d RTP/AVP 0 8\r\n", p1)
+	b.WriteString("a=rtpmap:0 PCMU/8000\r\n")
+	b.WriteString("a=rtpmap:8 PCMA/8000\r\n")
+	b.WriteString("a=sendonly\r\n")
+	fmt.Fprintf(&b, "m=audio %d RTP/AVP 0 8\r\n", p2)
+	b.WriteString("a=rtpmap:0 PCMU/8000\r\n")
+	b.WriteString("a=rtpmap:8 PCMA/8000\r\n")
+	b.WriteString("a=sendonly\r\n")
+	return b.String()
+}
+
 func (s *Server) Stop(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.udpConn != nil {
 		_ = s.udpConn.Close()
 		s.udpConn = nil
+	}
+	s.sessionMu.Lock()
+	subs := make([]*iptvSubscription, 0, len(s.iptvSubs))
+	for k, st := range s.iptvSubs {
+		subs = append(subs, st)
+		delete(s.iptvSubs, k)
+	}
+	s.sessionMu.Unlock()
+	for _, sub := range subs {
+		if sub != nil && sub.CloseFn != nil {
+			sub.CloseFn()
+		}
 	}
 	s.started = false
 	return nil

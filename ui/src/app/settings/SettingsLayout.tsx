@@ -9,9 +9,14 @@ function subNavClass({ isActive }: { isActive: boolean }) {
 
 const links = [
   { to: '/settings/users', label: 'Users' },
+  { to: '/settings/auth-users', label: 'Auth users' },
   { to: '/settings/config', label: 'Configuration' },
   { to: '/settings/conference', label: 'Conference groups' },
+  { to: '/settings/trunks', label: 'Trunks & dial plan' },
   { to: '/settings/recording', label: 'Recording' },
+  { to: '/settings/capture', label: 'Capture' },
+  { to: '/settings/iptv', label: 'IPTV' },
+  { to: '/settings/stack-health', label: 'Stack health' },
   { to: '/settings/database', label: 'Database' },
 ]
 

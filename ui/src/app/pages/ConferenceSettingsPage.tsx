@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 import yaml from 'js-yaml'
 import { apiFetch, apiPutText } from '../api/client'
-import type { ConferenceGroup, ConfigStatus, Endpoint, RootConfig } from '../api/types'
+import type { ConferenceGroup, ConfigStatus, Endpoint, IPTVSource, RootConfig } from '../api/types'
 
 export default function ConferenceSettingsPage() {
   const [cfg, setCfg] = useState<RootConfig | null>(null)
@@ -98,6 +98,19 @@ export default function ConferenceSettingsPage() {
     })
   }
 
+  function toggleIPTVSource(groupIdx: number, sourceID: string, checked: boolean) {
+    setDraft((d) => {
+      if (!d) return d
+      const conferenceGroups = [...(d.spec.conferenceGroups ?? [])]
+      const g = conferenceGroups[groupIdx]
+      const selected = new Set(g.iptv_source_ids ?? [])
+      if (checked) selected.add(sourceID)
+      else selected.delete(sourceID)
+      conferenceGroups[groupIdx] = { ...g, iptv_source_ids: Array.from(selected) }
+      return { ...d, spec: { ...d.spec, conferenceGroups } }
+    })
+  }
+
   function updateEndpoint(groupIdx: number, side: 'A' | 'B', epIdx: number, next: Endpoint) {
     setDraft((d) => {
       if (!d) return d
@@ -146,17 +159,16 @@ export default function ConferenceSettingsPage() {
 
   return (
     <div>
-      <div className="text-sm text-slate-400">
-        Conference line groups (MRD/ARD/HOOT).{' '}
+      <div className="rounded-2xl border border-slate-800 bg-slate-900/80 px-5 py-4 text-sm text-slate-300 shadow-sm shadow-slate-950/30">
+        Conference line groups (MRD/ARD/HOOT) can be managed here.{' '}
         <Link className="text-sky-400 underline hover:text-sky-300" to="/usage">
           Realtime Usage
         </Link>{' '}
-        shows active sessions per group (IVR dial-in and direct INVITE fanouts). Enable SIPREC per group when global recording
-        is configured under{' '}
+        shows active sessions per group. Enable SIPREC per group when global recording is configured under{' '}
         <Link className="text-sky-400 underline hover:text-sky-300" to="/settings/recording">
           Settings → Recording
         </Link>
-        . Link endpoints to user devices (employee id + device id) for CTI metadata. User access is managed under{' '}
+        . Link endpoints to user devices for CTI metadata. User access is managed under{' '}
         <Link className="text-sky-400 underline hover:text-sky-300" to="/settings/users">
           Users
         </Link>
@@ -169,11 +181,11 @@ export default function ConferenceSettingsPage() {
         </div>
       ) : null}
 
-      <section className="mt-6 rounded-xl border border-slate-800 bg-slate-950 p-4">
-        <div className="flex items-center justify-between">
-          <div className="text-sm font-semibold">Conference Line Groups</div>
+      <section className="mt-6 rounded-[24px] border border-slate-800 bg-slate-950 p-5 shadow-sm shadow-slate-950/20">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="text-sm font-semibold text-slate-100">Conference Line Groups</div>
           <button
-            className="rounded-md border border-slate-800 bg-slate-950 px-3 py-2 text-sm text-slate-200 hover:bg-slate-900"
+            className="rounded-2xl border border-slate-800 bg-slate-900 px-4 py-2 text-sm font-semibold text-slate-100 transition hover:bg-slate-800"
             onClick={() => addGroup()}
           >
             Add group
@@ -226,13 +238,16 @@ export default function ConferenceSettingsPage() {
                     min={0}
                   />
                   <div className="text-xs text-slate-500">timeout (s)</div>
-                  <label className="flex items-center gap-2 text-xs text-slate-300">
+                  <label
+                    className="flex items-center gap-2 text-xs text-slate-300"
+                    title="When on, SIPREC is forked for this conference while global recording is enabled. Independent of per-user settings."
+                  >
                     <input
                       type="checkbox"
                       checked={Boolean(g.recording_enabled)}
                       onChange={(e) => updateGroup(idx, { ...g, recording_enabled: e.target.checked })}
                     />
-                    SIPREC
+                    Record conference
                   </label>
                   <button
                     className="rounded-md border border-slate-800 bg-slate-950 px-2 py-1 text-xs text-slate-200 hover:bg-slate-900"
@@ -240,6 +255,26 @@ export default function ConferenceSettingsPage() {
                   >
                     Remove
                   </button>
+                </div>
+              </div>
+
+              <div className="mt-3 rounded-md border border-slate-800/80 bg-slate-950/60 p-2">
+                <div className="text-xs font-semibold text-slate-300">IPTV multicast feeds</div>
+                <div className="mt-2 flex flex-wrap gap-2">
+                  {(draft?.spec.iptvSources ?? []).map((src: IPTVSource) => (
+                    <label key={src.id} className="flex items-center gap-2 rounded-md border border-slate-800 px-2 py-1 text-xs text-slate-300">
+                      <input
+                        type="checkbox"
+                        checked={Boolean((g.iptv_source_ids ?? []).includes(src.id))}
+                        onChange={(e) => toggleIPTVSource(idx, src.id, e.target.checked)}
+                      />
+                      <span className="font-mono">{src.id}</span>
+                      <span className="text-slate-500">{src.name ?? src.multicast_ip}</span>
+                    </label>
+                  ))}
+                  {!(draft?.spec.iptvSources?.length ?? 0) ? (
+                    <div className="text-xs text-slate-500">No IPTV sources configured in Settings - IPTV.</div>
+                  ) : null}
                 </div>
               </div>
 

@@ -11,15 +11,26 @@ import (
 
 // NewTLSClientConfig builds a tls.Config for dialing Oracle / AudioCodes SBCs (TLS, optional mTLS, custom trust).
 func NewTLSClientConfig(cfg config.SIPConfig) (*tls.Config, error) {
+	return NewTLSClientConfigValues(
+		cfg.TLSServerName,
+		cfg.TLSRootCAFile,
+		cfg.TLSClientCertFile,
+		cfg.TLSClientKeyFile,
+		cfg.TLSInsecureSkipVerify,
+	)
+}
+
+// NewTLSClientConfigValues builds a tls.Config from explicit fields (used by per-trunk TLS profiles).
+func NewTLSClientConfigValues(serverName, rootCAFile, clientCertFile, clientKeyFile string, insecureSkipVerify bool) (*tls.Config, error) {
 	t := &tls.Config{
 		MinVersion: tls.VersionTLS12,
-		ServerName: cfg.TLSServerName,
+		ServerName: serverName,
 	}
-	if cfg.TLSInsecureSkipVerify {
+	if insecureSkipVerify {
 		t.InsecureSkipVerify = true
 	}
-	if cfg.TLSRootCAFile != "" {
-		pem, err := os.ReadFile(cfg.TLSRootCAFile)
+	if rootCAFile != "" {
+		pem, err := os.ReadFile(rootCAFile)
 		if err != nil {
 			return nil, fmt.Errorf("read TLS root CA: %w", err)
 		}
@@ -29,8 +40,8 @@ func NewTLSClientConfig(cfg config.SIPConfig) (*tls.Config, error) {
 		}
 		t.RootCAs = pool
 	}
-	if cfg.TLSClientCertFile != "" && cfg.TLSClientKeyFile != "" {
-		cert, err := tls.LoadX509KeyPair(cfg.TLSClientCertFile, cfg.TLSClientKeyFile)
+	if clientCertFile != "" && clientKeyFile != "" {
+		cert, err := tls.LoadX509KeyPair(clientCertFile, clientKeyFile)
 		if err != nil {
 			return nil, fmt.Errorf("load client cert: %w", err)
 		}

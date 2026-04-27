@@ -15,11 +15,16 @@ function baseUrl() {
   return b.replace(/\/$/, '')
 }
 
+function authToken() {
+  return localStorage.getItem('sipbridge.auth.token') ?? ''
+}
+
 export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   const url = `${baseUrl()}${path.startsWith('/') ? '' : '/'}${path}`
   const resp = await fetch(url, {
     ...init,
     headers: {
+      ...(authToken() ? { Authorization: `Bearer ${authToken()}` } : {}),
       ...(init?.headers ?? {}),
     },
   })

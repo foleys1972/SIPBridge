@@ -1,0 +1,64 @@
+{
+  "name": "Certificate",
+  "type": "object",
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Certificate display name"
+    },
+    "cert_type": {
+      "type": "string",
+      "enum": [
+        "TLS_CLIENT",
+        "TLS_CA",
+        "SRTP"
+      ],
+      "description": "Certificate type"
+    },
+    "issuer": {
+      "type": "string",
+      "description": "Certificate issuer"
+    },
+    "subject": {
+      "type": "string",
+      "description": "Certificate subject"
+    },
+    "valid_from": {
+      "type": "string",
+      "format": "date",
+      "description": "Valid from date"
+    },
+    "valid_to": {
+      "type": "string",
+      "format": "date",
+      "description": "Expiration date"
+    },
+    "fingerprint": {
+      "type": "string",
+      "description": "Certificate fingerprint (SHA-256)"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "valid",
+        "expired",
+        "revoked",
+        "pending"
+      ],
+      "default": "pending",
+      "description": "Certificate status"
+    },
+    "file_url": {
+      "type": "string",
+      "description": "Uploaded certificate file URL"
+    },
+    "associated_sbc": {
+      "type": "string",
+      "description": "Associated SBC address"
+    }
+  },
+  "required": [
+    "name",
+    "cert_type"
+  ]
+}

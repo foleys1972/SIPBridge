@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useState } from 'react'
-import { apiDelete, apiFetch, apiPutJson } from '../api/client'
+import { apiDelete, apiFetch, apiPostJson, apiPutJson } from '../api/client'
 import type {
   ConfigStatus,
   RecordingSettingsResponse,
   RecordingSpec,
   RecordingTrunkEntry,
   SIPRECIntegrationSpec,
+  SIPRECProbeResult,
 } from '../api/types'
 
 function emptySiprec(): SIPRECIntegrationSpec {
@@ -123,6 +124,9 @@ export default function RecordingSettingsPage() {
   const [cfgStatus, setCfgStatus] = useState<ConfigStatus | null>(null)
   const [spec, setSpec] = useState<RecordingSpec>(() => normalizeSaved(null))
   const [regionRows, setRegionRows] = useState<RegionRow[]>([])
+  const [probeLoading, setProbeLoading] = useState(false)
+  const [probeText, setProbeText] = useState('')
+  const [probeOk, setProbeOk] = useState<boolean | null>(null)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -181,6 +185,40 @@ export default function RecordingSettingsPage() {
       await load()
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  async function testSiprec() {
+    setErr('')
+    setProbeText('')
+    setProbeOk(null)
+    setProbeLoading(true)
+    try {
+      const r = await apiPostJson<SIPRECProbeResult>('/v1/settings/recording/test', {})
+      const dest = r.destination ? ` → ${r.destination}` : ''
+      const ms = r.roundtrip_ms != null ? ` (${r.roundtrip_ms} ms)` : ''
+      if (r.ok && r.reachable) {
+        setProbeOk(true)
+        setProbeText(
+          `SIPREC path OK: OPTIONS returned ${r.sip_status ?? '?'}${dest}${ms}. Target ${r.target_uri ?? '(unknown)'}.`,
+        )
+      } else if (r.reachable && r.sip_status) {
+        setProbeOk(false)
+        const hintBlock = r.hint ? `\n\n${r.hint}` : ''
+        setProbeText(
+          `Reachable but unexpected SIP ${r.sip_status} ${r.reason ?? ''}${dest}${ms}. ${r.error ?? ''}${hintBlock}`.trim(),
+        )
+      } else {
+        setProbeOk(false)
+        setProbeText(
+          `Probe failed${dest}${ms}: ${r.error ?? 'unknown error'} (step: ${r.step ?? '?'})`,
+        )
+      }
+    } catch (e) {
+      setProbeOk(false)
+      setErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setProbeLoading(false)
     }
   }
 
@@ -558,6 +596,15 @@ export default function RecordingSettingsPage() {
       <div className="mt-8 flex flex-wrap items-center gap-3">
         <button
           type="button"
+          className="rounded-md border border-emerald-800 bg-emerald-950/50 px-4 py-2 text-sm text-emerald-100 hover:bg-emerald-900/50 disabled:opacity-50"
+          disabled={probeLoading}
+          onClick={() => testSiprec()}
+          title="Sends SIP OPTIONS over UDP to the resolved recorder (same as SIPREC INVITE path)"
+        >
+          {probeLoading ? 'Testing SIPREC…' : 'Test SIPREC connectivity'}
+        </button>
+        <button
+          type="button"
           className="rounded-md bg-sky-600 px-4 py-2 text-sm font-semibold text-white hover:bg-sky-500 disabled:opacity-50"
           disabled={Boolean(cfgStatus?.config_read_only)}
           onClick={() => save()}
@@ -574,6 +621,19 @@ export default function RecordingSettingsPage() {
         </button>
         {status ? <span className="text-sm text-slate-400">{status}</span> : null}
       </div>
+      {probeText ? (
+        <div
+          className={
+            probeOk === true
+              ? 'mt-3 whitespace-pre-wrap rounded-lg border border-emerald-900/50 bg-emerald-950/30 p-3 text-sm text-emerald-100/90'
+              : probeOk === false
+                ? 'mt-3 whitespace-pre-wrap rounded-lg border border-amber-900/50 bg-amber-950/30 p-3 text-sm text-amber-100/90'
+                : 'mt-3 whitespace-pre-wrap rounded-lg border border-slate-800 bg-slate-900/40 p-3 text-sm text-slate-300'
+          }
+        >
+          {probeText}
+        </div>
+      ) : null}
 
       {err ? (
         <div className="mt-4 rounded-lg border border-rose-900/60 bg-rose-950 p-3 text-sm text-rose-200">{err}</div>

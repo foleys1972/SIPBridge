@@ -24,6 +24,9 @@ type Config struct {
 
 	// Cluster capacity limits (merged with spec.cluster from YAML at startup).
 	Cluster ClusterLimits
+
+	// LogDir is the directory for rotating log files.  Empty = stdout only.
+	LogDir string
 }
 
 type SIPConfig struct {
@@ -69,11 +72,11 @@ func LoadFromEnv() (Config, error) {
 			TLSClientKeyFile:      envOr("SIP_TLS_CLIENT_KEY_FILE", ""),
 			TLSInsecureSkipVerify: envBool("SIP_TLS_INSECURE_SKIP_VERIFY", false),
 			TLSServerName:       envOr("SIP_TLS_SERVER_NAME", ""),
-			SessionTimerEnabled: envBool("SIP_SESSION_TIMER_ENABLED", false),
+			SessionTimerEnabled: envBool("SIP_SESSION_TIMER_ENABLED", true),
 		},
 		API: APIConfig{
 			BindAddr: envOr("API_BIND_ADDR", "127.0.0.1"),
-			Port:     envOrInt("API_PORT", 8080),
+			Port:     envOrInt("API_PORT", 8081),
 		},
 		ConfigPath: envOr("CONFIG_PATH", "config.yaml"),
 
@@ -81,6 +84,8 @@ func LoadFromEnv() (Config, error) {
 		ConfigHTTPBearerToken: strings.TrimSpace(envOr("CONFIG_HTTP_BEARER_TOKEN", "")),
 		ConfigHTTPPollSeconds: envOrInt("CONFIG_HTTP_POLL_SECONDS", 0),
 		ConfigHTTPTLSInsecure:   envBool("CONFIG_HTTP_TLS_INSECURE", false),
+
+		LogDir: strings.TrimSpace(envOr("LOG_DIR", "")),
 
 		Cluster: ClusterLimits{
 			MaxConcurrentCalls:       envOrInt("SIPBRIDGE_MAX_CONCURRENT_CALLS", 0),

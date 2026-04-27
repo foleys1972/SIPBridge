@@ -1,0 +1,64 @@
+{
+  "name": "Line",
+  "type": "object",
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Display name for the line"
+    },
+    "line_type": {
+      "type": "string",
+      "enum": [
+        "ARD",
+        "MRD",
+        "HOOT"
+      ],
+      "description": "Type of private wire line"
+    },
+    "sbc_address": {
+      "type": "string",
+      "description": "SBC host address"
+    },
+    "sbc_port": {
+      "type": "number",
+      "description": "SBC port number"
+    },
+    "extension": {
+      "type": "string",
+      "description": "Line extension or dial string"
+    },
+    "counterparty": {
+      "type": "string",
+      "description": "Bank or counterparty name"
+    },
+    "desk": {
+      "type": "string",
+      "description": "Desk or department"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "idle",
+        "active",
+        "ringing",
+        "dnd",
+        "error",
+        "disconnected"
+      ],
+      "default": "idle",
+      "description": "Current line status"
+    },
+    "priority": {
+      "type": "number",
+      "default": 0,
+      "description": "Display priority order"
+    },
+    "codec": {
+      "type": "string",
+      "enum": [
+        "G.711",
+        "G.722",
+        "G.729",
+        "Opus"
+      ],
+ 

@@ -10,18 +10,19 @@ import (
 	"strings"
 	"time"
 
+	"gopkg.in/yaml.v3"
 	"sipbridge/internal/config"
 	"sipbridge/internal/sip"
-	"gopkg.in/yaml.v3"
 )
 
 type Server struct {
-	cfg         config.APIConfig
-	sipSrv      *sip.Server
-	runtimeSIP  config.SIPConfig
-	rootCfg     config.RootConfig
-	cm          *config.Manager
-	http        *http.Server
+	cfg        config.APIConfig
+	sipSrv     *sip.Server
+	runtimeSIP config.SIPConfig
+	rootCfg    config.RootConfig
+	cm         *config.Manager
+	http       *http.Server
+	authn      *authService
 }
 
 func (s *Server) bridgeFromConfig(bridgeID string) (config.Bridge, bool) {
@@ -37,11 +38,12 @@ func (s *Server) bridgeFromConfig(bridgeID string) (config.Bridge, bool) {
 }
 
 // handleBridgesV1 routes:
-//   GET  /v1/bridges              — list bridges from config + active call counts
-//   GET  /v1/bridges/{id}         — bridge definition + active calls
-//   GET  /v1/bridges/{id}/calls   — active calls only
-//   POST /v1/bridges/{id}/calls/drop — disconnect one participant
-//   POST /v1/bridges/{id}/reset   — disconnect all participants on the bridge
+//
+//	GET  /v1/bridges              — list bridges from config + active call counts
+//	GET  /v1/bridges/{id}         — bridge definition + active calls
+//	GET  /v1/bridges/{id}/calls   — active calls only
+//	POST /v1/bridges/{id}/calls/drop — disconnect one participant
+//	POST /v1/bridges/{id}/reset   — disconnect all participants on the bridge
 func (s *Server) handleBridgesV1(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/v1/bridges")
 	path = strings.Trim(path, "/")
@@ -142,11 +144,11 @@ func (s *Server) handleBridgeList(w http.ResponseWriter, r *http.Request) {
 	for _, b := range bridges {
 		calls := s.sipSrv.ListBridgeCalls(b.ID)
 		out = append(out, map[string]any{
-			"id":            b.ID,
-			"name":          b.Name,
-			"type":          b.Type,
-			"active_calls":  len(calls),
-			"participants":  b.Participants,
+			"id":           b.ID,
+			"name":         b.Name,
+			"type":         b.Type,
+			"active_calls": len(calls),
+			"participants": b.Participants,
 		})
 	}
 	_ = json.NewEncoder(w).Encode(map[string]any{"bridges": out})
@@ -168,13 +170,18 @@ func (s *Server) handleBridgeDetail(w http.ResponseWriter, r *http.Request, brid
 
 func NewServer(cfg config.APIConfig, sipSrv *sip.Server, runtimeSIP config.SIPConfig, rootCfg config.RootConfig, cm *config.Manager) *Server {
 	mux := http.NewServeMux()
-	s := &Server{cfg: cfg, sipSrv: sipSrv, runtimeSIP: runtimeSIP, rootCfg: rootCfg, cm: cm}
+	s := &Server{cfg: cfg, sipSrv: sipSrv, runtimeSIP: runtimeSIP, rootCfg: rootCfg, cm: cm, authn: newAuthService()}
 
 	mux.HandleFunc("/healthz", s.handleHealth)
+	mux.HandleFunc("/v1/auth/login", s.handleAuthLogin)
+	mux.HandleFunc("/v1/auth/me", s.handleAuthMe)
+	mux.HandleFunc("/v1/dashboard/services", s.handleServiceDashboard)
 	mux.HandleFunc("/v1/sip/stats", s.handleSIPStats)
 	mux.HandleFunc("/v1/settings/sip", s.handleSIPSettings)
 	mux.HandleFunc("/v1/settings/database", s.handleDatabaseSettings)
+	mux.HandleFunc("/v1/settings/recording/test", s.handleRecordingSIPRECProbe)
 	mux.HandleFunc("/v1/settings/recording", s.handleRecordingSettings)
+	mux.HandleFunc("/v1/settings/capture/test-write", s.handleCaptureTestWrite)
 	mux.HandleFunc("/v1/settings/cluster", s.handleClusterSettings)
 	mux.HandleFunc("/v1/config", s.handleConfig)
 	mux.HandleFunc("/v1/config/status", s.handleConfigStatus)
@@ -192,10 +199,12 @@ func NewServer(cfg config.APIConfig, sipSrv *sip.Server, runtimeSIP config.SIPCo
 	mux.HandleFunc("/v1/users/", s.handleUsersV1)
 	mux.HandleFunc("/v1/mi/attendance", s.handleMIAttendance)
 	mux.HandleFunc("/v1/conference-groups/usage", s.handleConferenceGroupsUsage)
+	mux.HandleFunc("/v1/iptv/subscriptions", s.handleIPTVSubscriptions)
+	mux.HandleFunc("/v1/iptv/subscriptions/stop", s.handleIPTVSubscriptionStop)
 
 	s.http = &http.Server{
 		Addr:              fmt.Sprintf("%s:%d", cfg.BindAddr, cfg.Port),
-		Handler:           mux,
+		Handler:           s.authMiddleware(mux),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	return s

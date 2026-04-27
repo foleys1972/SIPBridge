@@ -88,8 +88,8 @@ export default function OverviewPage() {
         <div className="rounded-xl border border-slate-800 bg-slate-950 p-4">
           <div className="text-sm font-semibold">What’s next</div>
           <div className="mt-2 text-sm text-slate-400">
-            MI data and realtime usage will be backed by additional endpoints.
-            RBAC is currently client-side scaffolding.
+            MI data and realtime usage are available via live API endpoints.
+            RBAC is enforced server-side with local and AD LDS auth support.
           </div>
         </div>
         <div className="rounded-xl border border-slate-800 bg-slate-950 p-4">
